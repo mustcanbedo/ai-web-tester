@@ -1,0 +1,34 @@
+# 测试产物（运行时生成）
+reports/
+screenshots/
+logs/
+snapshots/
+videos/
+session_cookies.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 废弃文件
+*_deprecated.*
+*_old.*
+_test_*

@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Web Tester - Playwright + LLM Agent</title>
+    <style>
+        :root {
+            --bg: #0f1117; --surface: #1a1d27; --surface2: #252830; --border: #2e3140;
+            --text: #e4e6eb; --text-dim: #8b8fa3; --accent: #4f6ef7; --accent-light: #7b93ff;
+            --green: #34d399; --red: #f87171; --yellow: #fbbf24; --orange: #fb923c;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        .header { padding: 12px 24px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+        .header h1 { font-size: 17px; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent-light)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .badge { font-size: 10px; padding: 3px 10px; background: rgba(79,110,247,0.12); color: var(--accent-light); border-radius: 10px; border: 1px solid rgba(79,110,247,0.25); }
+        .container { display: flex; flex: 1; overflow: hidden; }
+
+        /* Left Panel */
+        .left-panel { width: 340px; min-width: 340px; border-right: 1px solid var(--border); overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+        .left-panel::-webkit-scrollbar { width: 5px; }
+        .left-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        .section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+        .section-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+        .icon { font-size: 15px; }
+        .form-group { margin-bottom: 8px; }
+        .form-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; display: block; }
+        .form-input { width: 100%; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; outline: none; }
+        .form-input:focus { border-color: var(--accent); }
+        textarea.form-input { resize: vertical; }
+
+        /* Toggle */
+        .toggle-row { display: flex; align-items: center; justify-content: space-between; }
+        .toggle-label { font-size: 12px; font-weight: 500; }
+        .toggle-sub { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+        .toggle { position: relative; width: 36px; height: 20px; flex-shrink: 0; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider { position: absolute; inset: 0; background: var(--surface2); border-radius: 10px; cursor: pointer; transition: .3s; border: 1px solid var(--border); }
+        .toggle-slider:before { content: ''; position: absolute; width: 14px; height: 14px; left: 2px; bottom: 2px; background: var(--text-dim); border-radius: 50%; transition: .3s; }
+        .toggle input:checked + .toggle-slider { background: var(--accent); border-color: var(--accent); }
+        .toggle input:checked + .toggle-slider:before { transform: translateX(16px); background: white; }
+
+        /* Login config */
+        .login-config { display: none; margin-top: 10px; }
+        .login-config.active { display: block; }
+        .login-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+        .login-tab { padding: 5px 12px; font-size: 11px; border-radius: 6px; cursor: pointer; background: var(--bg); border: 1px solid var(--border); color: var(--text-dim); }
+        .login-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+        .login-fields { display: none; }
+        .login-fields.active { display: block; }
+
+        /* Spec editor */
+        .spec-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+        .spec-tab { padding: 4px 10px; font-size: 11px; border-radius: 5px; cursor: pointer; background: var(--bg); border: 1px solid var(--border); color: var(--text-dim); }
+        .spec-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+        .spec-editor-wrap { display: none; }
+        .spec-editor-wrap.active { display: block; }
+        #specEditor, #apiDocEditor { width: 100%; height: 160px; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 11px; font-family: 'SF Mono', Monaco, monospace; resize: vertical; outline: none; line-height: 1.6; }
+        #specEditor:focus, #apiDocEditor:focus { border-color: var(--accent); }
+        .spec-upload { padding: 20px; text-align: center; border: 2px dashed var(--border); border-radius: 8px; cursor: pointer; display: none; }
+        .spec-upload.active { display: block; }
+        .upload-icon { font-size: 28px; margin-bottom: 6px; }
+        .upload-text { font-size: 12px; color: var(--text-dim); }
+        .upload-hint { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+        .file-name { font-size: 11px; color: var(--green); margin-top: 6px; }
+
+        /* Action bar */
+        .action-bar { display: flex; gap: 8px; justify-content: flex-end; align-items: center; padding-top: 8px; }
+        .btn { padding: 8px 18px; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all .2s; }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-light); }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: var(--surface2); color: var(--text-dim); border: 1px solid var(--border); }
+        .btn-secondary:hover { color: var(--text); border-color: var(--text-dim); }
+
+        /* Right Panel */
+        .right-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .status-bar { padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 14px; flex-shrink: 0; flex-wrap: wrap; }
+        .status-indicator { display: flex; align-items: center; gap: 6px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+        .status-dot.running { background: var(--accent); animation: pulse 1.5s infinite; }
+        .status-dot.completed { background: var(--green); }
+        .status-dot.error { background: var(--red); }
+        .status-dot.waiting { background: var(--yellow); animation: pulse 1s infinite; }
+        .status-dot.paused { background: var(--orange); animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        #statusText { font-size: 12px; color: var(--text-dim); }
+        .stat-item { font-size: 11px; color: var(--text-dim); }
+        .stat-item span { color: var(--accent-light); font-weight: 600; }
+
+        /* Main content: split into checklist + screenshot (top) and log (bottom) */
+        .main-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+        /* Top area: checklist left + screenshot right */
+        .top-area { display: flex; flex: 1; min-height: 0; overflow: hidden; border-bottom: 1px solid var(--border); }
+
+        /* Checklist panel */
+        .checklist-panel { width: 50%; border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+        .panel-label { padding: 8px 14px; font-size: 11px; font-weight: 600; color: var(--text-dim); background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; align-items: center; gap: 6px; }
+        .checklist-body { flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; }
+        .checklist-body::-webkit-scrollbar { width: 5px; }
+        .checklist-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        .flow-group { margin-bottom: 14px; }
+        .flow-title { font-size: 12px; font-weight: 600; color: var(--accent-light); margin-bottom: 6px; padding: 4px 8px; background: rgba(79,110,247,0.08); border-radius: 6px; border-left: 3px solid var(--accent); }
+        .check-item { display: flex; align-items: flex-start; gap: 8px; padding: 5px 8px; border-radius: 5px; margin-bottom: 3px; font-size: 11px; line-height: 1.5; cursor: pointer; transition: background .15s; }
+        .check-item:hover { background: var(--surface2); }
+        .check-item.active { background: rgba(79,110,247,0.08); }
+        .check-icon { flex-shrink: 0; width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; font-size: 12px; margin-top: 1px; }
+        .check-icon.passed { color: var(--green); }
+        .check-icon.failed { color: var(--red); }
+        .check-icon.running { color: var(--accent); animation: pulse 1s infinite; }
+        .check-icon.waiting { color: var(--yellow); }
+        .check-text { flex: 1; color: var(--text); }
+        .check-step { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+
+        /* Screenshot panel */
+        .screenshot-panel { width: 50%; display: flex; flex-direction: column; overflow: hidden; }
+        .screenshot-body { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 10px; background: var(--bg); }
+        .screenshot-body img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; border: 1px solid var(--border); }
+        .screenshot-placeholder { text-align: center; color: var(--text-dim); }
+        .screenshot-placeholder .icon-large { font-size: 40px; margin-bottom: 8px; }
+        .screenshot-placeholder p { font-size: 12px; }
+        .screenshot-label { padding: 6px 14px; font-size: 10px; color: var(--text-dim); background: var(--surface); border-top: 1px solid var(--border); flex-shrink: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+        /* Log area (bottom) */
+        .log-area { height: 200px; min-height: 120px; overflow-y: auto; padding: 10px 14px; background: var(--bg); position: relative; }
+        .log-area::-webkit-scrollbar { width: 5px; }
+        .log-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        .log-label { position: sticky; top: 0; background: var(--surface); padding: 6px 14px; font-size: 11px; font-weight: 600; color: var(--text-dim); border-bottom: 1px solid var(--border); margin: -10px -14px 8px; z-index: 1; display: flex; align-items: center; gap: 6px; }
+        .log-entry { padding: 5px 8px; border-radius: 5px; margin-bottom: 4px; font-size: 11px; line-height: 1.5; border-left: 3px solid transparent; }
+        .log-entry.step { border-left-color: var(--accent); }
+        .log-entry.thinking { border-left-color: #a78bfa; background: rgba(167,139,250,0.05); }
+        .log-entry.success { border-left-color: var(--green); }
+        .log-entry.error { border-left-color: var(--red); background: rgba(248,113,113,0.05); }
+        .log-entry.bug { border-left-color: var(--orange); background: rgba(251,146,60,0.05); }
+        .log-entry.data { border-left-color: #06b6d4; background: rgba(6,182,212,0.05); }
+        .log-entry.api { border-left-color: #8b5cf6; background: rgba(139,92,246,0.05); }
+        .log-entry.complete { border-left-color: var(--green); background: rgba(52,211,153,0.08); }
+        .log-entry.waiting { border-left-color: var(--yellow); background: rgba(251,191,36,0.05); }
+        .log-header { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+        .log-tag { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; }
+        .tag-step { background: rgba(79,110,247,0.15); color: var(--accent-light); }
+        .tag-think { background: rgba(167,139,250,0.15); color: #a78bfa; }
+        .tag-action { background: rgba(52,211,153,0.15); color: var(--green); }
+        .tag-error { background: rgba(248,113,113,0.15); color: var(--red); }
+        .tag-bug { background: rgba(251,146,60,0.15); color: var(--orange); }
+        .tag-done { background: rgba(52,211,153,0.2); color: var(--green); }
+        .tag-wait { background: rgba(251,191,36,0.15); color: var(--yellow); }
+        .tag-data { background: rgba(6,182,212,0.15); color: #06b6d4; }
+        .tag-api { background: rgba(139,92,246,0.15); color: #8b5cf6; }
+        .log-time { font-size: 9px; color: var(--text-dim); }
+        .log-body { color: var(--text-dim); word-break: break-all; }
+
+        /* Human input card */
+        .human-input-card { display: none; background: var(--surface); border: 1px solid var(--yellow); border-radius: 8px; padding: 12px; margin: 8px 0; }
+        .human-input-card.active { display: block; }
+        .card-title { font-size: 13px; font-weight: 600; color: var(--yellow); margin-bottom: 4px; }
+        .card-desc { font-size: 11px; color: var(--text-dim); margin-bottom: 8px; }
+        .card-row { display: flex; gap: 8px; }
+        .card-input { flex: 1; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; outline: none; }
+        .card-input:focus { border-color: var(--yellow); }
+        .card-btn { padding: 8px 16px; background: var(--yellow); color: #000; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
+
+        /* Welcome */
+        .welcome-msg { text-align: center; padding: 40px 20px; color: var(--text-dim); flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .welcome-msg .welcome-icon { font-size: 48px; margin-bottom: 12px; }
+        .welcome-msg h2 { font-size: 16px; color: var(--text); margin-bottom: 8px; }
+        .welcome-msg p { font-size: 12px; line-height: 1.8; }
+
+        /* Modal */
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; width: 85%; max-width: 960px; max-height: 85vh; display: flex; flex-direction: column; }
+        .modal-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+        .modal-header h2 { font-size: 16px; }
+        .modal-close { background: none; border: none; color: var(--text-dim); font-size: 22px; cursor: pointer; }
+        .modal-close:hover { color: var(--text); }
+        .modal-body { flex: 1; overflow-y: auto; padding: 24px; }
+        .modal-body::-webkit-scrollbar { width: 6px; }
+        .modal-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        .report-content h1 { font-size: 20px; margin: 0 0 14px; color: var(--accent-light); }
+        .report-content h2 { font-size: 15px; margin: 18px 0 8px; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+        .report-content h3 { font-size: 13px; margin: 12px 0 6px; }
+        .report-content p { margin: 6px 0; line-height: 1.7; font-size: 12px; }
+        .report-content ul, .report-content ol { margin: 6px 0; padding-left: 20px; }
+        .report-content li { margin: 3px 0; line-height: 1.6; font-size: 12px; }
+        .report-content table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        .report-content th, .report-content td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; font-size: 11px; }
+        .report-content th { background: var(--surface2); font-weight: 600; }
+        .report-content td { background: var(--bg); }
+        .report-content hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+        .report-content strong { color: var(--accent-light); }
+        .report-content code { background: var(--surface2); padding: 2px 5px; border-radius: 3px; font-size: 10px; }
+
+        .hidden-file-input { display: none; }
+        .info-hint { padding: 8px 10px; background: rgba(79,110,247,0.08); border: 1px solid rgba(79,110,247,0.2); border-radius: 6px; margin-top: 6px; }
+        .info-hint .hint-title { font-size: 11px; color: var(--accent-light); font-weight: 600; }
+        .info-hint .hint-text { font-size: 10px; color: var(--text-dim); margin-top: 3px; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AI Web Tester</h1>
+        <div class="badge">Playwright + LLM Agent | Checklist 驱动 | 三层数据验证</div>
+    </div>
+
+    <div class="container">
+        <!-- Left Panel -->
+        <div class="left-panel">
+            <!-- 0. AI 模型配置 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#129302;</span> AI 模型配置</div>
+                <div class="toggle-row">
+                    <div>
+                        <div class="toggle-label">自定义模型</div>
+                        <div class="toggle-sub">默认使用系统内置模型</div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="customLLM" onchange="toggleLLMConfig()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div id="llmConfig" style="display:none; margin-top:10px;">
+                    <div class="form-group">
+                        <label class="form-label">预设模型</label>
+                        <select class="form-input" id="llmPreset" onchange="applyLLMPreset()" style="cursor:pointer;">
+                            <option value="custom">自定义</option>
+                            <option value="openai">OpenAI (GPT-4o-mini)</option>
+                            <option value="openai-4o">OpenAI (GPT-4o)</option>
+                            <option value="gemini">Google Gemini (gemini-2.0-flash)</option>
+                            <option value="gemini-lite">Google Gemini (gemini-2.0-flash-lite)</option>
+                            <option value="deepseek">DeepSeek (deepseek-chat)</option>
+                            <option value="qwen">通义千问 (qwen-plus)</option>
+                            <option value="zhipu">智谱 GLM (glm-4-flash)</option>
+                            <option value="kimi">月之暗面 Kimi (moonshot-v1-8k)</option>
+                            <option value="siliconflow">硅基流动 SiliconFlow</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">API Key *</label>
+                        <input class="form-input" id="llmApiKey" type="password" placeholder="sk-xxxx...">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Base URL</label>
+                        <input class="form-input" id="llmBaseUrl" type="url" placeholder="https://api.openai.com/v1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">模型名称</label>
+                        <input class="form-input" id="llmModel" placeholder="gpt-4o-mini">
+                    </div>
+                    <div class="info-hint">
+                        <div class="hint-title">兼容说明</div>
+                        <div class="hint-text">支持所有 OpenAI 兼容格式的 API（OpenAI、DeepSeek、通义千问、智谱、Kimi、硅基流动等）。选择预设模型会自动填充 Base URL 和模型名称，您只需填入 API Key。</div>
+                    </div>
+                    <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+                        <button id="testLLMBtn" onclick="testLLMConnection()" style="padding: 6px 14px; font-size: 11px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); cursor: pointer; transition: all .2s; display: flex; align-items: center; gap: 5px; white-space: nowrap;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+                            <span id="testLLMIcon">&#128268;</span> 测试连接
+                        </button>
+                        <div id="testLLMResult" style="font-size: 11px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 1. 测试目标 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#127919;</span> 测试目标</div>
+                <div class="form-group">
+                    <label class="form-label">目标网址 *</label>
+                    <input class="form-input" id="targetUrl" type="url" placeholder="https://your-app.com">
+                </div>
+            </div>
+
+            <!-- 2. 登录配置 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#128274;</span> 登录配置</div>
+                <div class="toggle-row">
+                    <div>
+                        <div class="toggle-label">需要登录</div>
+                        <div class="toggle-sub">测试前先完成登录流程</div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="needLogin" onchange="toggleLogin()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="login-config" id="loginConfig">
+                    <div class="form-group">
+                        <label class="form-label">登录页地址（留空则使用目标网址）</label>
+                        <input class="form-input" id="loginUrl" type="url" placeholder="https://your-app.com/login">
+                    </div>
+                    <div class="login-tabs" id="loginTabs">
+                        <div class="login-tab active" data-type="password" onclick="switchLoginType('password')">账号密码</div>
+                        <div class="login-tab" data-type="sms" onclick="switchLoginType('sms')">手机验证码</div>
+                    </div>
+                    <div class="login-fields active" id="fields-password">
+                        <div class="form-group">
+                            <label class="form-label">用户名 / 邮箱</label>
+                            <input class="form-input" id="loginUsername" placeholder="admin@example.com">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">密码</label>
+                            <input class="form-input" id="loginPassword" type="password" placeholder="输入密码">
+                        </div>
+                    </div>
+                    <div class="login-fields" id="fields-sms">
+                        <div class="form-group">
+                            <label class="form-label">手机号</label>
+                            <input class="form-input" id="loginPhone" placeholder="13800138000">
+                        </div>
+                        <!-- 人工输入卡片（验证码输入） -->
+                        <div class="human-input-card" id="humanInputCard">
+                            <div class="card-title" id="humanInputTitle">需要您的输入</div>
+                            <div class="card-desc" id="humanInputDesc">Agent 遇到了需要人工介入的环节。</div>
+                            <div class="card-row">
+                                <input class="card-input" id="humanInputValue" placeholder="请输入验证码" maxlength="20">
+                                <button class="card-btn" onclick="submitHumanInput()">继续 &#9654;</button>
+                            </div>
+                        </div>
+                        <div class="info-hint">
+                            <div class="hint-title">验证码交互说明</div>
+                            <div class="hint-text">Agent 会自动点击「获取验证码」按钮后暂停。<br>您在日志区看到提示后，输入收到的验证码即可继续。</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. 功能预期文档 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#128196;</span> 功能预期文档 *</div>
+                <div class="spec-tabs">
+                    <div class="spec-tab active" data-mode="edit" onclick="switchSpecMode('edit')">在线编辑</div>
+                    <div class="spec-tab" data-mode="upload" onclick="switchSpecMode('upload')">上传文件</div>
+                </div>
+                <div class="spec-editor-wrap active" id="specEditMode">
+                    <textarea id="specEditor" placeholder="描述您希望测试的核心流程、预期步骤和结果...&#10;&#10;例：&#10;## 流程1：创建订单&#10;1. 点击「新建订单」&#10;2. 填写商品信息&#10;3. 提交后应显示「创建成功」"></textarea>
+                </div>
+                <div class="spec-upload" id="specUploadMode" onclick="document.getElementById('specFileInput').click()">
+                    <div class="upload-icon">&#128449;</div>
+                    <div class="upload-text">点击上传功能预期文档</div>
+                    <div class="upload-hint">支持 .md / .txt 格式</div>
+                    <div class="file-name" id="specFileName"></div>
+                </div>
+                <input type="file" class="hidden-file-input" id="specFileInput" accept=".md,.txt,.markdown" onchange="handleSpecUpload(event)">
+            </div>
+
+            <!-- 4. 接口文档 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#128268;</span> 接口文档（可选）</div>
+                <div class="toggle-row" style="margin-bottom:8px;">
+                    <div>
+                        <div class="toggle-label">提供接口文档</div>
+                        <div class="toggle-sub">启用三层数据验证（后端→前后端→前端）</div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="hasApiDoc" onchange="toggleApiDoc()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div id="apiDocConfig" style="display:none;">
+                    <div class="spec-tabs">
+                        <div class="spec-tab active" data-mode="edit" onclick="switchApiDocMode('edit')">在线编辑</div>
+                        <div class="spec-tab" data-mode="upload" onclick="switchApiDocMode('upload')">上传文件</div>
+                    </div>
+                    <div id="apiDocEditMode" class="spec-editor-wrap active">
+                        <textarea id="apiDocEditor" placeholder="描述关键接口及其数据关系...&#10;&#10;例：&#10;## GET /api/sales/summary&#10;返回：{total: 总销售额}&#10;&#10;## GET /api/sales/by-region&#10;返回：[{region: 区域, amount: 金额}]&#10;&#10;数据关系：by-region 各 amount 之和 = summary.total"></textarea>
+                    </div>
+                    <div id="apiDocUploadMode" class="spec-upload" onclick="document.getElementById('apiDocFileInput').click()">
+                        <div class="upload-icon">&#128449;</div>
+                        <div class="upload-text">上传接口文档</div>
+                        <div class="upload-hint">支持 .md / .txt / .json / .yaml</div>
+                        <div class="file-name" id="apiDocFileName"></div>
+                    </div>
+                    <input type="file" class="hidden-file-input" id="apiDocFileInput" accept=".md,.txt,.json,.yaml,.yml,.markdown" onchange="handleApiDocUpload(event)">
+                    <div class="info-hint" style="margin-top:8px;">
+                        <div class="hint-title">三层数据验证体系</div>
+                        <div class="hint-text">
+                            <b>第一层</b>：直接调用 API 验证后端数据逻辑<br>
+                            <b>第二层</b>：对比接口返回数据与页面展示是否一致<br>
+                            <b>第三层</b>：验证页面内部数据逻辑（汇总、跨视图等）
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Action Bar -->
+            <div class="action-bar">
+                <button class="btn btn-primary" id="startBtn" onclick="startTest()">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    启动测试
+                </button>
+                <button class="btn btn-secondary" id="pauseBtn" onclick="togglePause()" style="display:none; font-size:11px;">
+                    <span id="pauseIcon">⏸</span> <span id="pauseLabel">暂停</span>
+                </button>
+                <button class="btn btn-secondary" id="resetBtn" onclick="resetTest()" style="display:none; font-size:11px; color: var(--red); border-color: var(--red);">
+                    ⏹ 终止
+                </button>
+                <button class="btn btn-secondary" id="resumeBtn" onclick="resumeFromSnapshot()" style="display:none; font-size:11px; color: var(--green); border-color: var(--green);">
+                    🔄 恢复测试
+                </button>
+            </div>
+        </div>
+
+        <!-- Right Panel -->
+        <div class="right-panel">
+            <div class="status-bar">
+                <div class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">等待启动</span>
+                </div>
+                <div class="stat-item" id="statSteps" style="display:none">步骤: <span id="stepCount">0</span></div>
+                <div class="stat-item" id="statBugs" style="display:none">问题: <span id="bugCount">0</span></div>
+                <div class="stat-item" id="statTokens" style="display:none" title="输入/输出 token 明细">Token: <span id="tokenCount">0</span> <span id="tokenDetail" style="font-size:10px;color:var(--text-dim)"></span></div>
+                <div class="stat-item" id="statDataChecks" style="display:none">数据校验: <span id="dataCheckCount">0</span></div>
+                <button class="btn btn-secondary" id="reportBtn" style="display:none; margin-left:auto; padding:5px 14px; font-size:11px;" onclick="showReport()">查看报告</button>
+            </div>
+
+            <div class="main-content">
+                <!-- Top: Checklist + Screenshot -->
+                <div class="top-area" id="topArea">
+                    <!-- Checklist -->
+                    <div class="checklist-panel">
+                        <div class="panel-label">&#9745; 测试 Checklist</div>
+                        <div class="checklist-body" id="checklistBody">
+                            <div class="welcome-msg" id="welcomeMsg">
+                                <div class="welcome-icon">&#129302;</div>
+                                <h2>准备就绪</h2>
+                                <p>在左侧配置测试目标和功能预期文档，<br>点击「启动测试」开始自主探索式测试。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Live Preview + Screenshot -->
+                    <div class="screenshot-panel">
+                        <div class="panel-label">
+                            <span id="screenshotPanelTitle">&#128247; AI 实时画面</span>
+                            <span id="liveIndicator" style="display:none;margin-left:8px;font-size:10px;color:#f43f5e;font-weight:700">● LIVE</span>
+                            <button class="btn btn-secondary" id="videoBtn" style="display:none;margin-left:auto;padding:2px 10px;font-size:10px;" onclick="showVideo()">&#127909; 回放视频</button>
+                        </div>
+                        <div class="screenshot-body" id="screenshotBody">
+                            <div class="screenshot-placeholder" id="screenshotPlaceholder">
+                                <div class="icon-large">&#128247;</div>
+                                <p>AI 操作页面时实时显示当前画面<br>点击 Checklist 项可查看对应截图</p>
+                            </div>
+                        </div>
+                        <div class="screenshot-label" id="screenshotLabel">等待测试启动</div>
+                    </div>
+                </div>
+
+                <!-- Bottom: Logs -->
+                <div class="log-area" id="logArea">
+                    <div class="log-label">
+                        <span>&#128203; 执行日志</span>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Report Modal -->
+    <div class="modal-overlay" id="reportModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>测试报告</h2>
+                <button class="modal-close" onclick="closeReport()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="report-content" id="reportContent"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentTaskId = null;
+        let reportContent = '';
+        let videoFile = null;
+        let stepCount = 0, bugCount = 0, totalTokens = 0, dataCheckCount = 0;
+        let currentLoginType = 'password';
+        let specMode = 'edit';
+        let apiDocMode = 'edit';
+        let uploadedSpecContent = '';
+        let uploadedApiDocContent = '';
+
+        // 截图存储：step -> {base64, label}
+        const screenshots = {};
+        // Checklist 数据：step -> {flow, item, status, element}
+        const checklistData = {};
+        // 当前流程分组
+        const flowGroups = {};
+
+        // ---- 登录配置 ----
+        function toggleLogin() {
+            document.getElementById('loginConfig').classList.toggle('active', document.getElementById('needLogin').checked);
+        }
+        function switchLoginType(type) {
+            currentLoginType = type;
+            document.querySelectorAll('.login-tab').forEach(t => t.classList.toggle('active', t.dataset.type === type));
+            document.querySelectorAll('.login-fields').forEach(f => f.classList.remove('active'));
+            document.getElementById('fields-' + type).classList.add('active');
+        }
+
+        // ---- 功能预期文档 ----
+        function switchSpecMode(mode) {
+            specMode = mode;
+            document.querySelectorAll('#specEditMode, #specUploadMode').forEach(el => el.classList.remove('active'));
+            if (mode === 'edit') document.getElementById('specEditMode').classList.add('active');
+            else document.getElementById('specUploadMode').classList.add('active');
+            document.querySelectorAll('.section:nth-child(3) .spec-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+        }
+        function handleSpecUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            document.getElementById('specFileName').textContent = '\u2705 ' + file.name;
+            const reader = new FileReader();
+            reader.onload = (e) => { uploadedSpecContent = e.target.result; document.getElementById('specEditor').value = uploadedSpecContent; };
+            reader.readAsText(file);
+        }
+
+        // ---- 接口文档 ----
+        function toggleApiDoc() {
+            document.getElementById('apiDocConfig').style.display = document.getElementById('hasApiDoc').checked ? 'block' : 'none';
+        }
+        function switchApiDocMode(mode) {
+            apiDocMode = mode;
+            document.getElementById('apiDocEditMode').classList.toggle('active', mode === 'edit');
+            document.getElementById('apiDocUploadMode').classList.toggle('active', mode === 'upload');
+            document.querySelectorAll('#apiDocConfig .spec-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+        }
+        function handleApiDocUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            document.getElementById('apiDocFileName').textContent = '\u2705 ' + file.name;
+            const reader = new FileReader();
+            reader.onload = (e) => { uploadedApiDocContent = e.target.result; document.getElementById('apiDocEditor').value = uploadedApiDocContent; };
+            reader.readAsText(file);
+        }
+
+        // ---- AI 模型配置 ----
+        function toggleLLMConfig() {
+            document.getElementById('llmConfig').style.display = document.getElementById('customLLM').checked ? 'block' : 'none';
+        }
+
+        const LLM_PRESETS = {
+            'openai': { base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+            'openai-4o': { base_url: 'https://api.openai.com/v1', model: 'gpt-4o' },
+            'gemini': { base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash' },
+            'gemini-lite': { base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash-lite' },
+            'deepseek': { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+            'qwen': { base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+            'zhipu': { base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+            'kimi': { base_url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+            'siliconflow': { base_url: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-V3' },
+        };
+
+        function applyLLMPreset() {
+            const preset = document.getElementById('llmPreset').value;
+            if (LLM_PRESETS[preset]) {
+                document.getElementById('llmBaseUrl').value = LLM_PRESETS[preset].base_url;
+                document.getElementById('llmModel').value = LLM_PRESETS[preset].model;
+            } else {
+                document.getElementById('llmBaseUrl').value = '';
+                document.getElementById('llmModel').value = '';
+            }
+            // 重置测试连接状态
+            document.getElementById('testLLMResult').textContent = '';
+            document.getElementById('testLLMResult').style.color = 'var(--text-dim)';
+        }
+
+        async function testLLMConnection() {
+            const apiKey = document.getElementById('llmApiKey').value.trim();
+            const baseUrl = document.getElementById('llmBaseUrl').value.trim();
+            const model = document.getElementById('llmModel').value.trim();
+            const btn = document.getElementById('testLLMBtn');
+            const icon = document.getElementById('testLLMIcon');
+            const result = document.getElementById('testLLMResult');
+
+            if (!apiKey) { result.textContent = '❗ 请先填写 API Key'; result.style.color = 'var(--red)'; return; }
+            if (!baseUrl) { result.textContent = '❗ 请先填写 Base URL'; result.style.color = 'var(--red)'; return; }
+            if (!model) { result.textContent = '❗ 请先填写模型名称'; result.style.color = 'var(--red)'; return; }
+
+            // 加载状态
+            btn.disabled = true;
+            btn.style.opacity = '0.6';
+            icon.textContent = '⏳';
+            result.textContent = '正在连接...';
+            result.style.color = 'var(--text-dim)';
+
+            try {
+                const resp = await fetch('/api/llm/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: apiKey, base_url: baseUrl, model: model })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    icon.textContent = '✅';
+                    result.textContent = data.message;
+                    result.style.color = 'var(--green)';
+                } else {
+                    icon.textContent = '❌';
+                    result.textContent = data.error;
+                    result.style.color = 'var(--red)';
+                }
+            } catch (e) {
+                icon.textContent = '❌';
+                result.textContent = '网络请求失败，请检查服务是否运行';
+                result.style.color = 'var(--red)';
+            } finally {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                // 3秒后恢复图标
+                setTimeout(() => { icon.textContent = '🔌'; }, 3000);
+            }
+        }
+
+        // ---- localStorage 持久化 ----
+        const STORAGE_KEYS = {
+            targetUrl: 'awt_target_url',
+            llmPreset: 'awt_llm_preset',
+            llmApiKey: 'awt_llm_api_key',
+            llmBaseUrl: 'awt_llm_base_url',
+            llmModel: 'awt_llm_model',
+            customLLM: 'awt_custom_llm',
+            needLogin: 'awt_need_login',
+            loginType: 'awt_login_type',
+            loginUrl: 'awt_login_url',
+            loginPhone: 'awt_login_phone',
+            loginUsername: 'awt_login_username',
+        };
+
+        function saveSettings() {
+            localStorage.setItem(STORAGE_KEYS.targetUrl, document.getElementById('targetUrl').value);
+            localStorage.setItem(STORAGE_KEYS.customLLM, document.getElementById('customLLM').checked);
+            if (document.getElementById('customLLM').checked) {
+                localStorage.setItem(STORAGE_KEYS.llmPreset, document.getElementById('llmPreset').value);
+                localStorage.setItem(STORAGE_KEYS.llmApiKey, document.getElementById('llmApiKey').value);
+                localStorage.setItem(STORAGE_KEYS.llmBaseUrl, document.getElementById('llmBaseUrl').value);
+                localStorage.setItem(STORAGE_KEYS.llmModel, document.getElementById('llmModel').value);
+            }
+            localStorage.setItem(STORAGE_KEYS.needLogin, document.getElementById('needLogin').checked);
+            if (document.getElementById('needLogin').checked) {
+                localStorage.setItem(STORAGE_KEYS.loginType, currentLoginType);
+                localStorage.setItem(STORAGE_KEYS.loginUrl, document.getElementById('loginUrl').value);
+                if (currentLoginType === 'sms') {
+                    localStorage.setItem(STORAGE_KEYS.loginPhone, document.getElementById('loginPhone').value);
+                } else {
+                    localStorage.setItem(STORAGE_KEYS.loginUsername, document.getElementById('loginUsername').value);
+                }
+            }
+        }
+
+        function restoreSettings() {
+            const saved = localStorage.getItem(STORAGE_KEYS.targetUrl);
+            if (!saved) return false;
+            document.getElementById('targetUrl').value = saved || '';
+            // LLM 配置
+            if (localStorage.getItem(STORAGE_KEYS.customLLM) === 'true') {
+                document.getElementById('customLLM').checked = true;
+                toggleLLMConfig();
+                const preset = localStorage.getItem(STORAGE_KEYS.llmPreset) || 'custom';
+                document.getElementById('llmPreset').value = preset;
+                document.getElementById('llmApiKey').value = localStorage.getItem(STORAGE_KEYS.llmApiKey) || '';
+                if (preset !== 'custom' && LLM_PRESETS[preset]) {
+                    // 非自定义预设：始终从代码中读取最新的 base_url 和 model
+                    document.getElementById('llmBaseUrl').value = LLM_PRESETS[preset].base_url;
+                    document.getElementById('llmModel').value = LLM_PRESETS[preset].model;
+                } else {
+                    document.getElementById('llmBaseUrl').value = localStorage.getItem(STORAGE_KEYS.llmBaseUrl) || '';
+                    document.getElementById('llmModel').value = localStorage.getItem(STORAGE_KEYS.llmModel) || '';
+                }
+            }
+            // 登录配置
+            if (localStorage.getItem(STORAGE_KEYS.needLogin) === 'true') {
+                document.getElementById('needLogin').checked = true;
+                toggleLogin();
+                const loginType = localStorage.getItem(STORAGE_KEYS.loginType) || 'password';
+                if (loginType !== currentLoginType) switchLoginType(loginType);
+                document.getElementById('loginUrl').value = localStorage.getItem(STORAGE_KEYS.loginUrl) || '';
+                if (loginType === 'sms') {
+                    document.getElementById('loginPhone').value = localStorage.getItem(STORAGE_KEYS.loginPhone) || '';
+                } else {
+                    document.getElementById('loginUsername').value = localStorage.getItem(STORAGE_KEYS.loginUsername) || '';
+                }
+            }
+            return true;
+        }
+
+        // ---- 加载示例 ----
+        function loadDefaultSpec() {
+            fetch('/api/specs/default').then(r => r.json()).then(data => {
+                document.getElementById('specEditor').value = data.content || '';
+                document.getElementById('targetUrl').value = 'https://todomvc.com/examples/react/dist/';
+            });
+        }
+
+        // ---- 获取配置 ----
+        function getTestConfig() {
+            const specContent = document.getElementById('specEditor').value.trim();
+            const targetUrl = document.getElementById('targetUrl').value.trim();
+            const needLogin = document.getElementById('needLogin').checked;
+            const hasApiDoc = document.getElementById('hasApiDoc').checked;
+            const config = { target_url: targetUrl, spec_content: specContent, need_login: needLogin };
+            // AI 模型配置
+            if (document.getElementById('customLLM').checked) {
+                const apiKey = document.getElementById('llmApiKey').value.trim();
+                const baseUrl = document.getElementById('llmBaseUrl').value.trim();
+                const model = document.getElementById('llmModel').value.trim();
+                if (!apiKey) { alert('请填写 API Key'); return config; }
+                config.llm_api_key = apiKey;
+                if (baseUrl) config.llm_base_url = baseUrl;
+                if (model) config.llm_model = model;
+            }
+            if (needLogin) {
+                config.login_url = document.getElementById('loginUrl').value.trim() || targetUrl;
+                config.login_type = currentLoginType;
+                if (currentLoginType === 'password') {
+                    config.username = document.getElementById('loginUsername').value.trim();
+                    config.password = document.getElementById('loginPassword').value;
+                } else {
+                    config.phone = document.getElementById('loginPhone').value.trim();
+                }
+            }
+            if (hasApiDoc) {
+                config.api_doc = document.getElementById('apiDocEditor').value.trim();
+            }
+            return config;
+        }
+
+        // ---- Checklist 管理 ----
+        function addChecklistItem(step, flow, item, status) {
+            const body = document.getElementById('checklistBody');
+            const welcome = document.getElementById('welcomeMsg');
+            if (welcome) welcome.style.display = 'none';
+
+            // 获取或创建流程分组
+            let groupEl = flowGroups[flow];
+            if (!groupEl) {
+                groupEl = document.createElement('div');
+                groupEl.className = 'flow-group';
+                groupEl.innerHTML = '<div class="flow-title">' + escapeHtml(flow || '测试流程') + '</div>';
+                body.appendChild(groupEl);
+                flowGroups[flow] = groupEl;
+            }
+
+            // 创建检查项
+            const el = document.createElement('div');
+            el.className = 'check-item';
+            el.dataset.step = step;
+            el.innerHTML = '<span class="check-icon ' + status + '">' + getStatusIcon(status) + '</span>'
+                + '<span class="check-text">' + escapeHtml(item || '步骤 ' + step) + '</span>'
+                + '<span class="check-step">#' + step + '</span>';
+            el.onclick = () => showScreenshot(step);
+            groupEl.appendChild(el);
+
+            checklistData[step] = { flow, item, status, element: el };
+
+            // 自动滚动到最新
+            body.scrollTop = body.scrollHeight;
+        }
+
+        function updateChecklistItem(step, status) {
+            const data = checklistData[step];
+            if (!data) return;
+            data.status = status;
+            const iconEl = data.element.querySelector('.check-icon');
+            if (iconEl) {
+                iconEl.className = 'check-icon ' + status;
+                iconEl.textContent = getStatusIcon(status);
+            }
+        }
+
+        function getStatusIcon(status) {
+            switch (status) {
+                case 'passed': return '\u2705';
+                case 'failed': return '\u274C';
+                case 'running': return '\u23F3';
+                case 'waiting': return '\u270B';
+                default: return '\u2B1C';
+            }
+        }
+
+        // ---- 截图管理 ----
+        function addScreenshot(step, base64, label) {
+            screenshots[step] = { base64, label };
+            // 自动展示最新截图
+            showScreenshot(step);
+        }
+
+        function showScreenshot(step) {
+            const data = screenshots[step];
+            const body = document.getElementById('screenshotBody');
+            const label = document.getElementById('screenshotLabel');
+            const placeholder = document.getElementById('screenshotPlaceholder');
+
+            // 高亮当前选中的 checklist 项
+            document.querySelectorAll('.check-item').forEach(el => el.classList.remove('active'));
+            const cl = checklistData[step];
+            if (cl && cl.element) cl.element.classList.add('active');
+
+            if (data && data.base64) {
+                if (placeholder) placeholder.style.display = 'none';
+                let img = body.querySelector('img');
+                if (!img) {
+                    img = document.createElement('img');
+                    body.appendChild(img);
+                }
+                img.src = 'data:image/png;base64,' + data.base64;
+                label.textContent = '#' + step + ' - ' + (data.label || '');
+            } else {
+                label.textContent = '步骤 #' + step + ' - 截图未获取';
+            }
+        }
+
+        // ---- 启动测试 ----
+        async function startTest() {
+            saveSettings();
+            const config = getTestConfig();
+            if (!config.target_url) { alert('请填写目标网址'); return; }
+            if (!config.spec_content) { alert('请输入或上传功能预期文档'); return; }
+
+            // 重置状态
+            stepCount = 0; bugCount = 0; totalTokens = 0; dataCheckCount = 0; reportContent = '';
+            Object.keys(screenshots).forEach(k => delete screenshots[k]);
+            Object.keys(checklistData).forEach(k => delete checklistData[k]);
+            Object.keys(flowGroups).forEach(k => delete flowGroups[k]);
+
+            document.getElementById('checklistBody').innerHTML = '';
+            document.getElementById('logArea').querySelectorAll('.log-entry').forEach(e => e.remove());
+            document.getElementById('humanInputCard').classList.remove('active');
+            document.getElementById('reportBtn').style.display = 'none';
+
+            // 重置截图区
+            const ssBody = document.getElementById('screenshotBody');
+            const img = ssBody.querySelector('img');
+            if (img) img.remove();
+            const ph = document.getElementById('screenshotPlaceholder');
+            if (ph) ph.style.display = 'block';
+            document.getElementById('screenshotLabel').textContent = '等待测试启动';
+            document.getElementById('liveIndicator').style.display = 'none';
+            document.getElementById('videoBtn').style.display = 'none';
+            document.getElementById('screenshotPanelTitle').innerHTML = '&#128247; AI 实时画面';
+            videoFile = null;
+
+            ['statSteps','statBugs','statTokens','statDataChecks'].forEach(id => document.getElementById(id).style.display = 'block');
+            setStatus('running', '正在启动测试...');
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('resumeBtn').style.display = 'none';
+
+            try {
+                const res = await fetch('/api/test/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config),
+                });
+                const data = await res.json();
+                if (data.error) { setStatus('error', data.error); document.getElementById('startBtn').disabled = false; return; }
+                currentTaskId = data.task_id;
+                showTestControls(true);
+                listenToStream(currentTaskId);
+            } catch (e) {
+                setStatus('error', '启动失败: ' + e.message);
+                document.getElementById('startBtn').disabled = false;
+            }
+        }
+
+        let isPaused = false;
+
+        function showTestControls(running) {
+            document.getElementById('pauseBtn').style.display = running ? 'inline-flex' : 'none';
+            document.getElementById('resetBtn').style.display = running ? 'inline-flex' : 'none';
+            if (running) {
+                isPaused = false;
+                document.getElementById('pauseIcon').textContent = '⏸';
+                document.getElementById('pauseLabel').textContent = '暂停';
+                document.getElementById('resumeBtn').style.display = 'none';
+            }
+        }
+
+        function showResumeButton() {
+            if (currentTaskId) {
+                document.getElementById('resumeBtn').style.display = 'inline-flex';
+            }
+        }
+
+        async function togglePause() {
+            if (!currentTaskId) return;
+            const btn = document.getElementById('pauseBtn');
+            btn.disabled = true;
+            try {
+                if (!isPaused) {
+                    const res = await fetch(`/api/test/${currentTaskId}/pause`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.status === 'paused') {
+                        isPaused = true;
+                        document.getElementById('pauseIcon').textContent = '▶';
+                        document.getElementById('pauseLabel').textContent = '继续';
+                        setStatus('paused', '测试已暂停');
+                    }
+                } else {
+                    const res = await fetch(`/api/test/${currentTaskId}/resume`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.status === 'running') {
+                        isPaused = false;
+                        document.getElementById('pauseIcon').textContent = '⏸';
+                        document.getElementById('pauseLabel').textContent = '暂停';
+                        setStatus('running', '测试已恢复');
+                    }
+                }
+            } catch (e) {
+                console.error('Pause/resume error:', e);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function resetTest() {
+            if (!currentTaskId) return;
+            if (!confirm('确定要终止当前测试吗？')) return;
+            try {
+                await fetch(`/api/test/${currentTaskId}/cancel`, { method: 'POST' });
+                setStatus('error', '测试已终止');
+                document.getElementById('startBtn').disabled = false;
+                showTestControls(false);
+                showResumeButton();
+            } catch (e) {
+                console.error('Reset error:', e);
+            }
+        }
+
+        async function resumeFromSnapshot() {
+            if (!currentTaskId) return;
+            const btn = document.getElementById('resumeBtn');
+            btn.disabled = true;
+            btn.textContent = '🔄 恢复中...';
+            try {
+                const res = await fetch(`/api/test/${currentTaskId}/resume-snapshot`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        rollback_steps: 1,
+                        llm_api_key: document.getElementById('llmApiKey')?.value || '',
+                        llm_base_url: document.getElementById('llmBaseUrl')?.value || '',
+                        llm_model: document.getElementById('llmModel')?.value || '',
+                    }),
+                });
+                const data = await res.json();
+                if (data.error) {
+                    alert('恢复失败: ' + data.error);
+                    btn.disabled = false;
+                    btn.textContent = '🔄 恢复测试';
+                    return;
+                }
+                currentTaskId = data.task_id;
+                btn.style.display = 'none';
+                document.getElementById('startBtn').disabled = true;
+                showTestControls(true);
+                setStatus('running', `从 Step ${data.resume_step} 恢复测试...`);
+                addLog('step', 'SYS', `🔄 从快照恢复（原任务 ${data.resumed_from}，回退到 Step ${data.resume_step}）`, new Date().toLocaleTimeString());
+                listenToStream(currentTaskId);
+            } catch (e) {
+                alert('恢复失败: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔄 恢复测试';
+            }
+        }
+
+        // ---- SSE 监听 ----
+        function listenToStream(taskId) {
+            const es = new EventSource('/api/test/' + taskId + '/stream');
+            es.onmessage = function(event) {
+                if (event.data.startsWith(':')) return;
+                try { handleEvent(JSON.parse(event.data)); } catch(e) { console.error('Parse error:', e); }
+            };
+            es.onerror = function() {
+                es.close();
+                if (document.getElementById('statusDot').className.includes('running'))
+                    setStatus('completed', '连接断开');
+                document.getElementById('startBtn').disabled = false;
+            };
+        }
+
+        // ---- 处理事件 ----
+        function handleEvent(msg) {
+            const { type, data, timestamp } = msg;
+            const time = timestamp ? new Date(timestamp).toLocaleTimeString() : '';
+
+            switch (type) {
+                case 'status':
+                    if (data.status === 'paused') {
+                        setStatus('paused', data.message);
+                    } else if (data.status === 'cancelled') {
+                        setStatus('error', data.message);
+                        document.getElementById('startBtn').disabled = false;
+                        showTestControls(false);
+                        showResumeButton();
+                    } else {
+                        setStatus('running', data.message);
+                    }
+                    addLog('step', 'SYS', data.message, time);
+                    break;
+                case 'log':
+                    addLog('step', 'LOG', data.message, time);
+                    break;
+                case 'step_start':
+                    stepCount = data.step;
+                    document.getElementById('stepCount').textContent = stepCount;
+                    if (data.max_steps > 0) {
+                        setStatus('running', '第 ' + data.step + ' / ' + data.max_steps + ' 步');
+                    } else {
+                        setStatus('running', '第 ' + data.step + ' 步');
+                    }
+                    break;
+                case 'thinking':
+                    setStatus('running', '第 ' + data.step + ' 步 - AI 思考中...');
+                    break;
+                case 'checklist':
+                    // 新增 checklist 项
+                    addChecklistItem(data.step, data.flow, data.item, data.status);
+                    break;
+                case 'checklist_update':
+                    // 更新 checklist 项状态
+                    updateChecklistItem(data.step, data.status);
+                    break;
+                case 'screenshot':
+                    // 收到截图
+                    addScreenshot(data.step, data.base64, data.label);
+                    break;
+                case 'decision':
+                    addLog('thinking', 'THINK', data.thinking, time);
+                    const actionDesc = (data.action?.type || '?') + ' ' + JSON.stringify(data.action?.params || {}).substring(0, 80);
+                    addLog('step', 'STEP ' + data.step, '[' + data.flow + '] ' + actionDesc, time);
+                    if (data.flow_status === 'passed') addLog('success', 'PASS', '\u6D41\u7A0B\u300C' + data.flow + '\u300D\u6D4B\u8BD5\u901A\u8FC7', time);
+                    else if (data.flow_status === 'failed') addLog('error', 'FAIL', '\u6D41\u7A0B\u300C' + data.flow + '\u300D\u6D4B\u8BD5\u5931\u8D25', time);
+                    break;
+                case 'step_result':
+                    if (data.action_type === 'call_api') {
+                        addLog('api', 'API', (data.success ? '\u2705 ' : '\u274C ') + data.message, time);
+                    } else if (data.action_type === 'verify_data' || data.action_type === 'compare_api_vs_page') {
+                        addLog('data', 'DATA', (data.success ? '\u2705 ' : '\u274C ') + data.message, time);
+                    } else {
+                        addLog(data.success ? 'success' : 'error', 'RESULT', (data.success ? '\u2705 ' : '\u274C ') + data.message, time);
+                    }
+                    break;
+                case 'bug':
+                    bugCount++;
+                    document.getElementById('bugCount').textContent = bugCount;
+                    addLog('bug', data.severity, data.title + ': ' + data.description, time);
+                    break;
+                case 'data_check':
+                    dataCheckCount++;
+                    document.getElementById('dataCheckCount').textContent = dataCheckCount;
+                    addLog('data', 'CHECK', '[' + data.check_type + '] ' + data.description, time);
+                    break;
+                case 'waiting_human_input':
+                    setStatus('waiting', '等待人工输入...');
+                    addLog('waiting', 'WAIT', data.message || '需要您的输入', time);
+                    showHumanInput(data.title || '需要您的输入', data.description || '请输入验证码', data.placeholder || '验证码');
+                    break;
+                case 'live_screenshot':
+                    // 实时显示 AI 当前看到的页面
+                    document.getElementById('liveIndicator').style.display = '';
+                    document.getElementById('screenshotPlaceholder').style.display = 'none';
+                    document.getElementById('screenshotBody').innerHTML = '<img src="data:image/jpeg;base64,' + data.base64 + '" style="width:100%;border-radius:6px;">';
+                    document.getElementById('screenshotLabel').textContent = 'Step ' + data.step + ' | ' + (data.action||'') + ' | ' + (data.label||'');
+                    break;
+                case 'token_update':
+                    totalTokens = (data.input || 0) + (data.output || 0);
+                    document.getElementById('tokenCount').textContent = totalTokens.toLocaleString();
+                    document.getElementById('tokenDetail').textContent = '(in:' + (data.input||0).toLocaleString() + ' out:' + (data.output||0).toLocaleString() + ')';
+                    document.getElementById('statTokens').style.display = '';
+                    break;
+                case 'complete':
+                    setStatus('completed', '测试完成');
+                    totalTokens = (data.token_usage?.input || 0) + (data.token_usage?.output || 0);
+                    document.getElementById('tokenCount').textContent = totalTokens.toLocaleString();
+                    document.getElementById('tokenDetail').textContent = '(in:' + (data.token_usage?.input||0).toLocaleString() + ' out:' + (data.token_usage?.output||0).toLocaleString() + ')';
+                    document.getElementById('statTokens').style.display = '';
+                    document.getElementById('stepCount').textContent = data.total_steps;
+                    document.getElementById('bugCount').textContent = data.issues_count;
+                    reportContent = data.report_content || '';
+                    document.getElementById('reportBtn').style.display = 'block';
+                    document.getElementById('startBtn').disabled = false;
+                    showTestControls(false);
+                    // 隐藏 LIVE 指示器
+                    document.getElementById('liveIndicator').style.display = 'none';
+                    document.getElementById('screenshotPanelTitle').innerHTML = '&#128247; 步骤截图';
+                    // 显示视频回放按钮
+                    videoFile = data.video_file;
+                    if (videoFile) { document.getElementById('videoBtn').style.display = ''; }
+                    const c = data.issues_count > 0 ? '\u274C \u53D1\u73B0\u95EE\u9898' : '\u2705 \u5168\u90E8\u901A\u8FC7';
+                    addLog('complete', 'DONE', '\u6D4B\u8BD5\u5B8C\u6210 | \u6B65\u9AA4: ' + data.total_steps + ' | \u95EE\u9898: ' + data.issues_count + ' | Token: ' + totalTokens.toLocaleString() + ' | ' + c, time);
+                    break;
+                case 'error':
+                    setStatus('error', data.message);
+                    addLog('error', 'ERROR', data.message, time);
+                    document.getElementById('startBtn').disabled = false;
+                    showTestControls(false);
+                    showResumeButton();
+                    break;
+            }
+        }
+
+        // ---- 人工输入 ----
+        function showHumanInput(title, desc, placeholder) {
+            document.getElementById('humanInputTitle').textContent = '\u270B ' + title;
+            document.getElementById('humanInputDesc').textContent = desc;
+            document.getElementById('humanInputValue').placeholder = placeholder || '请输入';
+            document.getElementById('humanInputValue').value = '';
+            document.getElementById('humanInputCard').classList.add('active');
+            document.getElementById('humanInputValue').focus();
+        }
+        async function submitHumanInput() {
+            const value = document.getElementById('humanInputValue').value.trim();
+            if (!value) { alert('请输入内容'); return; }
+            document.getElementById('humanInputCard').classList.remove('active');
+            setStatus('running', '已提交，继续测试...');
+            addLog('step', 'INPUT', '\u7528\u6237\u8F93\u5165: ' + value, new Date().toLocaleTimeString());
+            try {
+                await fetch('/api/test/' + currentTaskId + '/human-input', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value: value }),
+                });
+            } catch (e) {
+                addLog('error', 'ERROR', '\u63D0\u4EA4\u5931\u8D25: ' + e.message, new Date().toLocaleTimeString());
+            }
+        }
+        document.getElementById('humanInputValue').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') submitHumanInput();
+        });
+
+        // ---- UI 辅助 ----
+        function setStatus(state, text) {
+            document.getElementById('statusDot').className = 'status-dot ' + state;
+            document.getElementById('statusText').textContent = text;
+        }
+        function addLog(cls, tag, body, time) {
+            const area = document.getElementById('logArea');
+            const tagCls = {
+                step:'tag-step', thinking:'tag-think', success:'tag-action', error:'tag-error',
+                bug:'tag-bug', complete:'tag-done', waiting:'tag-wait', data:'tag-data', api:'tag-api'
+            }[cls] || 'tag-step';
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + cls;
+            entry.innerHTML = '<div class="log-header"><span class="log-tag ' + tagCls + '">' + tag + '</span><span class="log-time">' + time + '</span></div><div class="log-body">' + escapeHtml(body) + '</div>';
+            area.appendChild(entry);
+            area.scrollTop = area.scrollHeight;
+        }
+        function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+        // ---- 报告弹窗 ----
+        function showReport() { document.getElementById('reportContent').innerHTML = renderMarkdown(reportContent); document.getElementById('reportModal').classList.add('active'); }
+        function closeReport() { document.getElementById('reportModal').classList.remove('active'); }
+        function showVideo() {
+            if (!videoFile) return;
+            const body = document.getElementById('screenshotBody');
+            body.innerHTML = '<video controls autoplay style="width:100%;border-radius:6px;" src="/api/video/' + videoFile + '"></video>';
+            document.getElementById('screenshotLabel').textContent = '测试录像回放';
+        }
+        function renderMarkdown(md) {
+            if (!md) return '<p>暂无报告内容</p>';
+            let h = md.replace(/^### (.*$)/gm,'<h3>$1</h3>').replace(/^## (.*$)/gm,'<h2>$1</h2>').replace(/^# (.*$)/gm,'<h1>$1</h1>')
+                .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/^---$/gm,'<hr>').replace(/^- (.*$)/gm,'<li>$1</li>').replace(/`([^`]+)`/g,'<code>$1</code>');
+            h = h.replace(/^\|(.+)\|$/gm, (m) => { const c = m.split('|').filter(x=>x.trim()); if(c.every(x=>/^[\s-:]+$/.test(x))) return ''; return '<tr>'+c.map(x=>'<td>'+x.trim()+'</td>').join('')+'</tr>'; });
+            h = h.replace(/(<tr>.*<\/tr>\s*)+/g, (m) => { const f=m.match(/<tr>(.*?)<\/tr>/); if(f){m=f[0].replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>')+m.substring(f[0].length);} return '<table>'+m+'</table>'; });
+            h = h.split('\n').map(l=>{l=l.trim();if(!l)return '';if(l.startsWith('<'))return l;return '<p>'+l+'</p>';}).join('\n');
+            h = h.replace(/(<li>.*<\/li>\s*)+/g,'<ul>$&</ul>');
+            return h;
+        }
+
+        window.addEventListener('load', () => {
+            const hasSettings = restoreSettings();
+            // 总是加载默认 spec 文档，但只在没有保存的 URL 时覆盖目标地址
+            fetch('/api/specs/default').then(r => r.json()).then(data => {
+                document.getElementById('specEditor').value = data.content || '';
+                if (!hasSettings) {
+                    document.getElementById('targetUrl').value = 'https://todomvc.com/examples/react/dist/';
+                }
+            });
+        });
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeReport(); });
+
+        // 页面加载时检查是否有可用快照
+        fetch('/api/snapshots').then(r => r.json()).then(data => {
+            if (data.snapshots && data.snapshots.length > 0) {
+                const latest = data.snapshots[0];
+                currentTaskId = latest.task_id;
+                const btn = document.getElementById('resumeBtn');
+                btn.style.display = 'inline-flex';
+                btn.title = `从 Step ${latest.step} 恢复 (${latest.last_url})`;
+                setStatus('completed', `有可恢复的快照 (Step ${latest.step})`);
+            }
+        }).catch(() => {});
+    </script>
+</body>
+</html>
