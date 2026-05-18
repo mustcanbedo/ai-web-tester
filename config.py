@@ -17,8 +17,13 @@ for d in [SCREENSHOT_DIR, REPORT_DIR, LOG_DIR, SPECS_DIR, SNAPSHOT_DIR, VIDEO_DI
 
 MAX_STEPS = 500  # 安全上限，正常情况下由智能终止检测决定何时停止
 STUCK_THRESHOLD = 5  # 连续相同操作 / 连续失败 / 连续 wait 达到此数则强制终止
-MIN_STEPS_BEFORE_FINISH = 20  # LLM 至少跑这么多步才允许 finish
+MIN_STEPS_BEFORE_FINISH = 30  # 兜底默认值，实际由 estimate_min_steps() 从文档动态计算
 LLM_MODEL = "deepseek-ai/DeepSeek-V3"
+
+# Guardrail：禁止 Agent 访问的 URL 模式
+BLOCKED_URL_PATTERNS = [
+    "projectId=25",
+]
 
 # 跨测试会话复用登录态
 COOKIES_FILE = BASE_DIR / "session_cookies.json"

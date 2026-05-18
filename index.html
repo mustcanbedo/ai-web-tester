@@ -198,6 +198,29 @@
         .info-hint { padding: 8px 10px; background: rgba(79,110,247,0.08); border: 1px solid rgba(79,110,247,0.2); border-radius: 6px; margin-top: 6px; }
         .info-hint .hint-title { font-size: 11px; color: var(--accent-light); font-weight: 600; }
         .info-hint .hint-text { font-size: 10px; color: var(--text-dim); margin-top: 3px; line-height: 1.5; }
+
+        /* 测试模式选择器 */
+        .mode-selector { display: flex; gap: 8px; margin-top: 4px; }
+        .mode-btn { flex: 1; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); cursor: pointer; transition: all .2s; text-align: center; }
+        .mode-btn:hover { border-color: var(--accent); }
+        .mode-btn.active { border-color: var(--accent); background: rgba(79,110,247,0.1); }
+        .mode-btn .mode-icon { font-size: 20px; margin-bottom: 4px; }
+        .mode-btn .mode-title { font-size: 12px; font-weight: 600; color: var(--text); }
+        .mode-btn .mode-desc { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+
+        /* 脚本列表 */
+        .script-list { margin-top: 8px; }
+        .script-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; cursor: pointer; transition: all .15s; }
+        .script-item:hover { border-color: var(--accent); background: rgba(79,110,247,0.05); }
+        .script-item.selected { border-color: var(--accent); background: rgba(79,110,247,0.1); }
+        .script-item input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+        .script-item .script-info { flex: 1; }
+        .script-item .script-name { font-size: 11px; font-weight: 600; color: var(--text); }
+        .script-item .script-meta { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+        .script-empty { text-align: center; padding: 20px; color: var(--text-dim); font-size: 11px; }
+        .script-upload-area { display: flex; align-items: center; justify-content: center; padding: 10px; border: 1px dashed var(--border); border-radius: 6px; margin-top: 6px; cursor: pointer; transition: all .15s; }
+        .script-upload-area:hover { border-color: var(--accent); }
+        .script-upload-area span { font-size: 11px; color: var(--text-dim); }
     </style>
 </head>
 <body>
@@ -272,6 +295,35 @@
                 </div>
             </div>
 
+            <!-- 1.5 测试模式 -->
+            <div class="section">
+                <div class="section-title"><span class="icon">&#9881;</span> 测试模式</div>
+                <div class="mode-selector">
+                    <div class="mode-btn active" data-mode="explore" onclick="switchTestMode('explore')">
+                        <div class="mode-icon">&#128270;</div>
+                        <div class="mode-title">探索式测试</div>
+                        <div class="mode-desc">AI 自主探索，发现未知问题</div>
+                    </div>
+                    <div class="mode-btn" data-mode="script" onclick="switchTestMode('script')">
+                        <div class="mode-icon">&#128203;</div>
+                        <div class="mode-title">脚本化测试</div>
+                        <div class="mode-desc">YAML 脚本驱动，精确回归验证</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 1.6 脚本选择（脚本化模式下可见） -->
+            <div class="section" id="scriptSection" style="display:none;">
+                <div class="section-title"><span class="icon">&#128203;</span> 测试脚本</div>
+                <div class="script-list" id="scriptList">
+                    <div class="script-empty" id="scriptLoading">加载中...</div>
+                </div>
+                <div class="script-upload-area" onclick="document.getElementById('scriptFileInput').click()">
+                    <span>&#10133; 上传 YAML 脚本</span>
+                </div>
+                <input type="file" class="hidden-file-input" id="scriptFileInput" accept=".yaml,.yml" onchange="handleScriptUpload(event)">
+            </div>
+
             <!-- 2. 登录配置 -->
             <div class="section">
                 <div class="section-title"><span class="icon">&#128274;</span> 登录配置</div>
@@ -327,7 +379,7 @@
             </div>
 
             <!-- 3. 功能预期文档 -->
-            <div class="section">
+            <div class="section" id="specSection">
                 <div class="section-title"><span class="icon">&#128196;</span> 功能预期文档 *</div>
                 <div class="spec-tabs">
                     <div class="spec-tab active" data-mode="edit" onclick="switchSpecMode('edit')">在线编辑</div>
@@ -346,7 +398,7 @@
             </div>
 
             <!-- 4. 接口文档 -->
-            <div class="section">
+            <div class="section" id="apiDocSection">
                 <div class="section-title"><span class="icon">&#128268;</span> 接口文档（可选）</div>
                 <div class="toggle-row" style="margin-bottom:8px;">
                     <div>
@@ -464,7 +516,10 @@
         <div class="modal">
             <div class="modal-header">
                 <h2>测试报告</h2>
-                <button class="modal-close" onclick="closeReport()">&times;</button>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <button class="btn btn-secondary" onclick="downloadReport()" style="padding:4px 12px;font-size:11px;">下载 .md</button>
+                    <button class="modal-close" onclick="closeReport()">&times;</button>
+                </div>
             </div>
             <div class="modal-body">
                 <div class="report-content" id="reportContent"></div>
@@ -482,6 +537,89 @@
         let apiDocMode = 'edit';
         let uploadedSpecContent = '';
         let uploadedApiDocContent = '';
+        let currentTestMode = 'explore';  // 'explore' | 'script'
+        let availableScripts = [];
+        let selectedScripts = new Set();
+
+        // ---- 测试模式切换 ----
+        function switchTestMode(mode) {
+            currentTestMode = mode;
+            document.querySelectorAll('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+            const specSec = document.getElementById('specSection');
+            const apiDocSec = document.getElementById('apiDocSection');
+            const scriptSec = document.getElementById('scriptSection');
+            if (mode === 'explore') {
+                if (specSec) specSec.style.display = '';
+                if (apiDocSec) apiDocSec.style.display = '';
+                if (scriptSec) scriptSec.style.display = 'none';
+            } else {
+                if (specSec) specSec.style.display = 'none';
+                if (apiDocSec) apiDocSec.style.display = 'none';
+                if (scriptSec) scriptSec.style.display = '';
+                loadScripts();
+            }
+            localStorage.setItem('awt_test_mode', mode);
+        }
+
+        async function loadScripts() {
+            const listEl = document.getElementById('scriptList');
+            listEl.innerHTML = '<div class="script-empty">加载中...</div>';
+            try {
+                const res = await fetch('/api/scripts');
+                const data = await res.json();
+                availableScripts = data.scripts || [];
+                if (availableScripts.length === 0) {
+                    listEl.innerHTML = '<div class="script-empty">暂无测试脚本<br><span style="font-size:10px;margin-top:4px;display:block;">请上传 YAML 脚本或使用提示词从源码生成</span></div>';
+                    return;
+                }
+                listEl.innerHTML = '';
+                availableScripts.forEach(s => {
+                    const item = document.createElement('div');
+                    item.className = 'script-item' + (selectedScripts.has(s.filename) ? ' selected' : '');
+                    item.innerHTML = '<input type="checkbox" ' + (selectedScripts.has(s.filename) ? 'checked' : '') + '>'
+                        + '<div class="script-info">'
+                        + '<div class="script-name">' + escapeHtml(s.flow) + '</div>'
+                        + '<div class="script-meta">' + escapeHtml(s.filename) + ' | ' + s.steps_count + ' 步' + (s.precondition ? ' | 前置: ' + s.precondition : '') + '</div>'
+                        + '</div>';
+                    item.onclick = (e) => {
+                        if (e.target.tagName === 'INPUT') return;
+                        const cb = item.querySelector('input[type="checkbox"]');
+                        cb.checked = !cb.checked;
+                        toggleScript(s.filename, cb.checked, item);
+                    };
+                    item.querySelector('input').onchange = (e) => toggleScript(s.filename, e.target.checked, item);
+                    listEl.appendChild(item);
+                });
+            } catch (e) {
+                listEl.innerHTML = '<div class="script-empty">加载失败: ' + e.message + '</div>';
+            }
+        }
+
+        function toggleScript(filename, checked, itemEl) {
+            if (checked) {
+                selectedScripts.add(filename);
+                itemEl.classList.add('selected');
+            } else {
+                selectedScripts.delete(filename);
+                itemEl.classList.remove('selected');
+            }
+        }
+
+        async function handleScriptUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const res = await fetch('/api/scripts/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.error) { alert('上传失败: ' + data.error); return; }
+                loadScripts();
+            } catch (e) {
+                alert('上传失败: ' + e.message);
+            }
+            event.target.value = '';
+        }
 
         // 截图存储：step -> {base64, label}
         const screenshots = {};
@@ -507,7 +645,7 @@
             document.querySelectorAll('#specEditMode, #specUploadMode').forEach(el => el.classList.remove('active'));
             if (mode === 'edit') document.getElementById('specEditMode').classList.add('active');
             else document.getElementById('specUploadMode').classList.add('active');
-            document.querySelectorAll('.section:nth-child(3) .spec-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+            document.querySelectorAll('#specSection .spec-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
         }
         function handleSpecUpload(event) {
             const file = event.target.files[0];
@@ -818,7 +956,13 @@
             saveSettings();
             const config = getTestConfig();
             if (!config.target_url) { alert('请填写目标网址'); return; }
-            if (!config.spec_content) { alert('请输入或上传功能预期文档'); return; }
+
+            // 模式校验
+            if (currentTestMode === 'explore') {
+                if (!config.spec_content) { alert('请输入或上传功能预期文档'); return; }
+            } else {
+                if (selectedScripts.size === 0) { alert('请至少选择一个测试脚本'); return; }
+            }
 
             // 重置状态
             stepCount = 0; bugCount = 0; totalTokens = 0; dataCheckCount = 0; reportContent = '';
@@ -849,10 +993,38 @@
             document.getElementById('resumeBtn').style.display = 'none';
 
             try {
-                const res = await fetch('/api/test/start', {
+                let apiUrl, body;
+                if (currentTestMode === 'explore') {
+                    apiUrl = '/api/test/start';
+                    body = config;
+                } else {
+                    // 脚本化测试：依次启动选中的脚本（目前先启动第一个，后续支持批量）
+                    const scriptFiles = Array.from(selectedScripts);
+                    apiUrl = '/api/test/script/start';
+                    body = {
+                        target_url: config.target_url,
+                        script_file: scriptFiles[0],
+                        script_files: scriptFiles,
+                    };
+                    // 传递 LLM 配置（脚本化的 AI 验证也需要）
+                    if (config.llm_api_key) body.llm_api_key = config.llm_api_key;
+                    if (config.llm_base_url) body.llm_base_url = config.llm_base_url;
+                    if (config.llm_model) body.llm_model = config.llm_model;
+                    // 传递登录配置
+                    if (config.need_login) {
+                        body.need_login = true;
+                        body.login_type = config.login_type;
+                        body.login_url = config.login_url;
+                        body.username = config.username;
+                        body.password = config.password;
+                        body.phone = config.phone;
+                    }
+                }
+
+                const res = await fetch(apiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(config),
+                    body: JSON.stringify(body),
                 });
                 const data = await res.json();
                 if (data.error) { setStatus('error', data.error); document.getElementById('startBtn').disabled = false; return; }
@@ -1061,10 +1233,16 @@
                     break;
                 case 'live_screenshot':
                     // 实时显示 AI 当前看到的页面
-                    document.getElementById('liveIndicator').style.display = '';
-                    document.getElementById('screenshotPlaceholder').style.display = 'none';
-                    document.getElementById('screenshotBody').innerHTML = '<img src="data:image/jpeg;base64,' + data.base64 + '" style="width:100%;border-radius:6px;">';
-                    document.getElementById('screenshotLabel').textContent = 'Step ' + data.step + ' | ' + (data.action||'') + ' | ' + (data.label||'');
+                    if (data.base64) {
+                        document.getElementById('liveIndicator').style.display = '';
+                        document.getElementById('screenshotPlaceholder').style.display = 'none';
+                        document.getElementById('screenshotBody').innerHTML = '<img src="data:image/jpeg;base64,' + data.base64 + '" style="width:100%;border-radius:6px;">';
+                        document.getElementById('screenshotLabel').textContent = 'Step ' + data.step + ' | ' + (data.action||'') + ' | ' + (data.label||'');
+                        // 同步存储，确保点击 checklist 时也能查看
+                        if (!screenshots[data.step] || !screenshots[data.step].base64) {
+                            screenshots[data.step] = { base64: data.base64, label: (data.action||'') + ' | ' + (data.label||'') };
+                        }
+                    }
                     break;
                 case 'token_update':
                     totalTokens = (data.input || 0) + (data.output || 0);
@@ -1154,6 +1332,19 @@
         // ---- 报告弹窗 ----
         function showReport() { document.getElementById('reportContent').innerHTML = renderMarkdown(reportContent); document.getElementById('reportModal').classList.add('active'); }
         function closeReport() { document.getElementById('reportModal').classList.remove('active'); }
+        function downloadReport() {
+            if (!reportContent) { alert('暂无报告内容'); return; }
+            const blob = new Blob([reportContent], { type: 'text/markdown;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const ts = new Date().toISOString().slice(0,19).replace(/[T:]/g, '-');
+            a.download = `test-report-${ts}.md`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
         function showVideo() {
             if (!videoFile) return;
             const body = document.getElementById('screenshotBody');
@@ -1180,6 +1371,11 @@
                     document.getElementById('targetUrl').value = 'https://todomvc.com/examples/react/dist/';
                 }
             });
+            // 恢复测试模式偏好
+            const savedMode = localStorage.getItem('awt_test_mode');
+            if (savedMode && savedMode !== currentTestMode) {
+                switchTestMode(savedMode);
+            }
         });
         document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeReport(); });
 

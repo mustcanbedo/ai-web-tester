@@ -1,11 +1,31 @@
-# AI Web Tester - Playwright + LLM 自动化测试系统
+# AI Web Tester - AI 开发验收测试工具
 
-基于 Playwright 和大型语言模型（LLM）的自主探索式 Web 自动化测试工具。根据自然语言编写的"功能预期文档"，像人类测试工程师一样自主探索 Web 应用，发现功能缺陷并生成测试报告。
+**使用场景**：AI 全流程开发完一个 Web 应用后，你不确定它是不是完全按照产品设计文档来实现的。用这个工具，**先让 AI 阅读源码生成测试文档，再让 AI Agent 自动化测试找 Bug**。
+
+## 工作流程
+
+```
+产品设计文档（PRD）
+       │
+       │  ① 用 prompt-generate-docs.md 提示词
+       │     让 AI 阅读前端源码，生成两份测试文档
+       ▼
+  core-flow.md（功能预期文档）+ api-docs.md（接口文档）
+       │
+       │  ② AI Agent 按文档自动化测试
+       │     逐流程执行操作、验证预期结果
+       ▼
+  测试报告（Bug 列表 + 截图证据 + 视频录制）
+       │
+       │  ③ 对比产品设计文档
+       ▼
+  发现"代码实现与设计预期的偏差" = Bug
+```
 
 ## 核心特性
 
-- **预期驱动**：测试输入是自然语言的功能预期文档（`specs/core-flow.md`），描述系统应如何工作，无需编写脚本。
-- **自主探索**：Agent 根据预期文档和当前页面的 Accessibility Tree 状态，自主决策下一步操作。
+- **提示词驱动文档生成**：内置 `prompt-generate-docs.md` 提示词模板，让 AI（Cursor/Windsurf/Claude）阅读你的前端源码，自动生成测试所需的功能预期文档和接口文档。
+- **自主探索测试**：Agent 根据功能预期文档和当前页面的 Accessibility Tree 状态，像人类测试工程师一样自主决策下一步操作。
 - **智能判断**：实时监听 Console 错误和 Network 异常，结合页面状态判断是否为 Bug。
 - **视频录制**：Playwright 原生录制完整测试过程，事后可回看。
 - **实时截图**：每步操作自动截图并推送到前端 LIVE 面板，实时观察 AI 正在做什么。
@@ -71,7 +91,16 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 启动服务
+### 2. 生成测试文档（关键步骤）
+
+在 AI IDE（Cursor / Windsurf）中打开你的**前端项目源码**，将 `prompt-generate-docs.md` 中的提示词发给 AI，它会阅读源码并生成两份文档：
+
+- **`core-flow.md`**（功能预期文档）— 描述每个功能的操作步骤和预期结果
+- **`api-docs.md`**（接口文档）— 描述后端 API 接口，用于数据一致性验证
+
+将生成的文档放入 `specs/` 目录。
+
+### 3. 启动服务并测试
 
 ```bash
 python3 app.py
@@ -81,24 +110,17 @@ python3 app.py
 
 1. 配置 LLM（API Key、Base URL、模型名称），点击"测试连接"验证
 2. 输入目标网站 URL
-3. 上传或编辑功能预期文档
+3. 上传或编辑功能预期文档（第 2 步生成的 `core-flow.md`）
 4. 配置登录信息（如需要，支持账号密码/手机验证码两种方式）
 5. 点击"开始测试"
 
-所有配置通过 UI 完成，无需设置环境变量。
+### 4. 查看结果
 
-### 3. 查看结果
-
-- **右侧 LIVE 面板** — 实时查看 AI 当前看到的页面
+- **右侧 LIVE 面板** — 实时查看 AI 当前看到的页面截图
 - **执行日志** — 每步操作的详细记录
-- **reports/** — Markdown 测试报告
+- **reports/** — Markdown 格式测试报告（Bug 列表 + 证据）
 - **screenshots/** — 每步截图和错误快照
-- **videos/** — 完整测试过程视频录制
-- **logs/** — JSON 格式完整执行日志
-
-### 4. 生成测试文档
-
-使用 `prompt-generate-docs.md` 中的提示词，在 AI IDE（Cursor/Windsurf）中打开你的前端项目，让 AI 自动生成 `core-flow.md` 和 `api-docs.md` 两份测试文档。
+- **videos/** — Playwright 录制的完整测试过程视频
 
 ## 如何定制
 

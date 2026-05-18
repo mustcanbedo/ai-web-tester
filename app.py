@@ -21,7 +21,7 @@ from config import (
     BASE_DIR, SCREENSHOT_DIR, REPORT_DIR, LOG_DIR, SPECS_DIR,
     SNAPSHOT_DIR, VIDEO_DIR, MAX_TASKS,
 )
-from test_runner import run_test_task, resume_test_task
+from test_runner import run_test_task, resume_test_task, run_script_task
 
 
 # ============================================================
@@ -347,6 +347,101 @@ async def test_llm_connection(request: Request):
         else:
             hint = error_msg
         return JSONResponse({"success": False, "error": hint}, status_code=200)
+
+
+# ============================================================
+# 脚本化测试 API
+# ============================================================
+
+SCRIPT_DIR = BASE_DIR / "test_scripts"
+SCRIPT_DIR.mkdir(exist_ok=True)
+
+
+@app.get("/api/scripts")
+async def list_scripts():
+    """列出所有可用的 YAML 测试脚本"""
+    scripts = []
+    if SCRIPT_DIR.exists():
+        import yaml
+        for f in sorted(SCRIPT_DIR.glob("*.yaml")):
+            try:
+                data = yaml.safe_load(f.read_text(encoding="utf-8"))
+                scripts.append({
+                    "filename": f.name,
+                    "flow": data.get("flow", f.stem),
+                    "steps_count": len(data.get("steps", [])),
+                    "precondition": data.get("precondition", ""),
+                })
+            except Exception:
+                scripts.append({"filename": f.name, "flow": f.stem, "steps_count": 0, "precondition": ""})
+    return JSONResponse({"scripts": scripts})
+
+
+@app.post("/api/scripts/upload")
+async def upload_script(request: Request):
+    """上传 YAML 测试脚本"""
+    from fastapi import UploadFile
+    import yaml
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse({"error": "未选择文件"}, status_code=400)
+
+    filename = file.filename
+    if not filename.endswith((".yaml", ".yml")):
+        return JSONResponse({"error": "仅支持 .yaml / .yml 格式"}, status_code=400)
+
+    content = await file.read()
+    try:
+        # 验证 YAML 格式
+        data = yaml.safe_load(content.decode("utf-8"))
+        if not isinstance(data, dict) or "steps" not in data:
+            return JSONResponse({"error": "YAML 文件缺少 steps 字段"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"YAML 解析失败: {str(e)}"}, status_code=400)
+
+    dest = SCRIPT_DIR / filename
+    dest.write_bytes(content)
+    return JSONResponse({
+        "success": True,
+        "filename": filename,
+        "flow": data.get("flow", filename),
+        "steps_count": len(data.get("steps", [])),
+    })
+
+
+@app.post("/api/test/script/start")
+async def start_script_test(request: Request):
+    """启动脚本化测试（确定性操作 + AI 验证）"""
+    body = await request.json()
+    target_url = body.get("target_url", "")
+    script_file = body.get("script_file", "")
+    if not target_url.strip():
+        return JSONResponse({"error": "目标网址不能为空"}, status_code=400)
+    if not script_file.strip():
+        return JSONResponse({"error": "请选择测试脚本"}, status_code=400)
+
+    script_path = SCRIPT_DIR / script_file
+    if not script_path.exists():
+        return JSONResponse({"error": f"脚本文件不存在: {script_file}"}, status_code=400)
+
+    _cleanup_old_tasks()
+
+    task_id = str(uuid.uuid4())[:8]
+    tasks[task_id] = {
+        "id": task_id, "status": "starting", "mode": "script",
+        "start_time": datetime.datetime.now().isoformat(),
+        "log_queue": queue.Queue(), "human_input_queue": queue.Queue(),
+        "config": body,
+        "pause_event": threading.Event(), "cancel_event": threading.Event(),
+        "event_history": [],
+        "event_counter": 0,
+    }
+    tasks[task_id]["pause_event"].set()
+    thread = threading.Thread(target=run_script_task, args=(task_id, body, tasks), daemon=True)
+    thread.start()
+    return JSONResponse({"task_id": task_id, "status": "started", "mode": "script"})
 
 
 @app.get("/", response_class=HTMLResponse)

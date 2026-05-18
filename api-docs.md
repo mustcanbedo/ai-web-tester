@@ -57,16 +57,16 @@
 
 ### 2.1 发送短信验证码
 
-- **接口路径**：`POST {manifoldtech_cloud}/sms/valid`
-- **Content-Type**：`application/json`
-- **描述**：向指定手机号发送 4 位数字登录验证码。
+- **接口路径**：`POST {manifoldtech_cloud}/common/smsValid`
+- **Content-Type**：`multipart/form-data`
+- **描述**：向指定手机号发送 4 位数字验证码，支持登录、注册、重置密码、换绑手机号等场景。
 
 **请求参数**：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `phone` | string | 是 | 纯数字手机号（不含区号前缀） |
-| `action` | string | 是 | 固定值 `"login_by_phone"` |
+| `action` | string | 是 | 场景标识：`"login_by_phone"` / `"register"` / `"reset_pwd"` / `"change_account"` |
 | `dial_code` | string | 否 | 国际区号，如 `"+86"` |
 
 **请求示例**：
@@ -251,6 +251,105 @@
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `icon` | File | 是 | 头像图片文件 |
+
+---
+
+### 2.10 Google 登录
+
+- **接口路径**：`POST {manifoldtech_cloud}/user/loginByGoogle`
+- **Content-Type**：`multipart/form-data`
+- **Header**：`platform: MindCloudXAI_Google`
+- **描述**：通过 Google OAuth 授权码完成登录（自动注册）。前端通过 Google OAuth 弹窗获取 `code`，再提交给此接口换取用户信息和 Token。
+
+**请求参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `code` | string | 是 | Google OAuth 授权码 |
+
+**响应结构**：同 2.2。
+
+---
+
+### 2.11 发送邮箱验证码
+
+- **接口路径**：`POST {manifoldtech_cloud}/common/emailValid`
+- **Content-Type**：`multipart/form-data`
+- **描述**：向指定邮箱发送验证码，支持注册、重置密码、换绑邮箱等场景。
+
+**请求参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `email` | string | 是 | 邮箱地址 |
+| `action` | string | 是 | 场景标识：`"register"` / `"reset_pwd"` / `"change_account"` |
+
+**响应示例**：
+```json
+{
+  "code": 0,
+  "message": "success"
+}
+```
+
+---
+
+### 2.12 校验验证码
+
+- **接口路径**：`POST {manifoldtech_cloud}/common/checkValid`
+- **Content-Type**：`multipart/form-data`
+- **描述**：校验手机号或邮箱的验证码是否正确，用于注册和重置密码流程中的前置验证。
+
+**请求参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `phone` 或 `email` | string | 是 | 手机号或邮箱（二选一） |
+| `action` | string | 是 | 场景标识：`"register"` / `"reset_pwd"` |
+| `validate` | string | 是 | 验证码 |
+
+**响应示例**：
+```json
+{
+  "code": 0,
+  "message": "success"
+}
+```
+
+---
+
+### 2.13 换绑账号
+
+- **接口路径**：`POST {manifoldtech_cloud}/user/changeAccount`
+- **Content-Type**：`multipart/form-data`
+- **描述**：更换绑定的手机号或邮箱。
+
+**请求参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `phone` 或 `email` | string | 是 | 新手机号或新邮箱（二选一） |
+| `validate` | string | 是 | 新手机号/邮箱收到的验证码 |
+| `dial_code` | string | 否 | 国际区号（换绑手机号时使用） |
+
+**响应结构**：同 2.2。
+
+---
+
+### 2.14 刷新用户缓存
+
+- **接口路径**：`POST {manifoldtech_cloud}/user/refreshCache`
+- **Content-Type**：`multipart/form-data`
+- **Header**：`token: <JWT>`
+- **描述**：刷新服务端用户信息缓存。
+
+**响应示例**：
+```json
+{
+  "code": 0,
+  "message": "success"
+}
+```
 
 ---
 
@@ -476,8 +575,25 @@
             "zip_url": "https://xxx/cad_model.zip"
           },
           "mesh": {
+            "url": "https://xxx/mesh.ply",
+            "zip_url": "https://xxx/mesh.zip",
+            "size": 52428800
+          },
+          "texture": {
+            "url": "https://xxx/texture.png",
+            "zip_url": "https://xxx/texture.zip",
+            "zip_size": 10485760
+          },
+          "obj": {
+            "url": "https://xxx/model.obj",
+            "zip_url": "https://xxx/model_obj.zip",
+            "size": 31457280
+          },
+          "tiles_3d": {
             "url": "https://xxx/tileset.json",
-            "zip_url": "https://xxx/mesh.zip"
+            "zip_url": "https://xxx/tiles3d.zip",
+            "zip_size": 104857600,
+            "json": { "asset": {}, "root": {} }
           }
         },
         "sparse": {
@@ -505,8 +621,13 @@
 - `progress`：训练进度百分比（0-100）。
 - `progress_status`：细粒度进度状态码。
 - `creator`：创建者用户 ID，用于判断编辑权限。
-- `output_result`：训练输出结果，包含各格式文件的 URL。
-- `input_config`：训练输入配置（quality / resolution / loop 等）。
+- `output_result`：训练输出结果，包含各格式文件的 URL。各子字段按任务类型不同：
+  - `splat` / `ply` / `spx`：3DGS 类型
+  - `potree` / `pointcloud`：点云类型
+  - `cad`：CAD 类型
+  - `mesh` / `texture` / `tiles_3d`：Mesh 类型（`tiles_3d.json` 为内联 tileset.json，子 tile URI 已签名）
+  - `obj`：通用 OBJ 格式
+- `input_config`：训练输入配置（quality / resolution / loop / text_true 等）。
 
 ---
 
@@ -547,8 +668,11 @@
 
 **Mesh（task_type=4）**：
 ```json
-{}
+{
+  "text_true": 0
+}
 ```
+- `text_true`：纹理贴图开关，`0`=关闭, `1`=开启
 
 **完整请求示例（3DGS）**：
 ```json
@@ -811,9 +935,11 @@ taskAddApi({ project_id, task_type, task_name, input_config })
 ```
 taskListApi → data.list[].task_code
                         ↓
-    前端跳转 /gs/editor?taskId={task_code}
-    或       /gs/viewer?taskId={task_code}
-    或       /pointcloud/viewer?taskId={task_code}
+    前端按任务类型跳转不同页面：
+    ├─ 3DGS  → /gs/editor?taskId={task_code}（新标签页）
+    ├─ 点云   → /app/pointcloud-viewer?taskId={task_code}&from={当前路径}
+    ├─ CAD   → /app/cad-viewer?taskId={task_code}&from={当前路径}
+    └─ Mesh  → /mesh/editor?taskId={task_code}（新标签页）
                         ↓
        taskShareDetailApi({ task_code }) → 获取完整任务数据
                         ↓
@@ -832,7 +958,23 @@ getCosTemKey → data.credentials (临时密钥)
               保存成功，返回 status: 0
 ```
 
-### 6.6 任务状态流转
+### 6.6 训练列表 → 查看器/编辑器
+
+```
+taskListApi → data.list[].task_code
+                        ↓
+    前端按任务类型跳转不同页面：
+    ├─ 3DGS  → /gs/editor?taskId={task_code}（新标签页）
+    ├─ 点云   → /app/pointcloud-viewer?taskId={task_code}&from={当前路径}
+    ├─ CAD   → /app/cad-viewer?taskId={task_code}&from={当前路径}
+    └─ Mesh  → /mesh/editor?taskId={task_code}（新标签页）
+                        ↓
+       taskShareDetailApi({ task_code }) → 获取完整任务数据
+                        ↓
+            读取 output_result 中的文件 URL 加载模型
+```
+
+### 6.7 任务状态流转
 
 ```
 taskAddApi (创建) → status=1 (队列中)
@@ -845,7 +987,7 @@ taskAddApi (创建) → status=1 (队列中)
              失败时可调用 taskRetryApi → 重新 status=1
 ```
 
-### 6.7 前端轮询机制
+### 6.8 前端轮询机制
 
 - 训练列表页面挂载后，每 **10 秒**调用一次 `taskListApi` 刷新数据。
 - 使用 `fetchVersion` 防止快速切换 Tab 时旧请求覆盖新数据。
