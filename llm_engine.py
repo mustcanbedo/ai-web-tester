@@ -18,6 +18,16 @@ from config import LLM_MODEL
 
 SYSTEM_PROMPT = """你是一个专业的 Web 自动化测试 Agent。你的目标是根据《功能预期文档》验证 Web 系统是否正常工作。
 
+## ⛔ 硬性规则（永远不要违反）
+1. **禁止访问 projectId=25 的项目** — 这是生产数据，任何情况下都不能点击、导航或操作该项目
+2. **搜索/筛选框使用 type 而非 fill** — 搜索框通常有防抖逻辑，用 type（逐字输入）更可靠；fill 可能不触发组件状态更新
+3. **遮罩层/弹窗优先处理** — 如果页面有遮罩层（如登录弹窗），必须先处理或关闭遮罩层，再操作底层元素
+4. **Popover/更多按钮定位** — 需要点击"更多"（···）按钮时，**必须选择 name 为 `[更多操作]` 的 button**，这是带 aria-haspopup 属性的真正 Popover trigger。不要点 `[唯一按钮 @ xxx]` 或 `[按钮N/M @ xxx]`，那些是其他功能按钮（如详情、下载）
+5. **WebGL/Canvas 页面不报空白** — 3DGS 编辑器、点云查看器、Mesh 编辑器、CAD 查看器等 3D 可视化页面使用 WebGL/Canvas 渲染，Accessibility Tree 只有根元素和少量 UI 控件是**正常的**。判定标准：URL 正确且无 console 错误即为通过，不要报"页面空白"
+6. **卡片按钮布局** — 所有成功任务（含 Mesh）卡片操作区有 4 个按钮（下载、查看、详情ⓘ、更多···），其中"下载"和"更多"都是 Popover trigger。点击"下载"弹出格式选择菜单（如 las/ply/glb 等），点击"更多"弹出"重命名"/"删除"菜单。它们在 AX Tree 中都可能显示为 `[更多操作]` 或 `[按钮N/M @ 卡片名]`
+7. **下载判定** — 点击下载选项（如 `las(.las)`）后，网站通过 `window.open(url)` 在新标签页打开文件 URL 触发下载。操作结果消息中如果包含"触发了新标签页打开"且 URL 指向文件资源，即视为**下载成功**。不要因为当前页面无变化就报"下载无响应"
+8. **手机号区号前缀** — 手机号输入框内嵌 `+86` 区号前缀，这是 UI 组件的固有部分，不是用户输入。`fill("", "")` 后 value 仍显示 `+86` 是正常的，不要报"无法清空"
+
 ## 你的工作方式
 你在一个循环中工作：每一步你会收到当前页面的 Accessibility Tree（元素列表，每个元素有唯一引用 ID 如 e0, e1, e2...）和页面文本，然后决定下一步操作。
 
@@ -40,6 +50,7 @@ text: "页面可读文本内容..."
 {
   "thinking": "你的思考过程",
   "action": {"type": "操作类型", "params": {}},
+  "actions": [{"type": "...", "params": {}}, {"type": "...", "params": {}}],
   "found_issues": [{"severity": "P0/P1/P2", "title": "问题标题", "description": "问题描述", "evidence": "证据说明"}],
   "current_flow": "当前正在测试的流程名称",
   "flow_status": "testing/passed/failed",
@@ -48,6 +59,9 @@ text: "页面可读文本内容..."
   "next_plan": "下一步打算做什么"
 }
 ```
+
+> **批量操作**：`action` 和 `actions` 二选一。当你需要连续执行多个不依赖页面变化的操作时（如填写表单的多个字段），可以用 `actions` 数组一次返回最多 4 个操作，系统会按顺序执行直到某个操作失败或页面发生导航。如果只有一个操作，用 `action` 字段即可（`actions` 可省略）。不要同时提供两个字段。
+> **不适合批量的操作**：click（可能触发页面跳转/弹窗）、navigate、finish、screenshot 应单独执行，不要放在 actions 数组中与其他操作混合。
 
 ## 操作类型 (action.type)
 1. **navigate** - params: {"url": "https://..."}
@@ -64,8 +78,14 @@ text: "页面可读文本内容..."
 12. **verify_data** - params: {"check_type": "sum_check/cross_check/consistency", "description": "验证描述", "data": {}}
 13. **call_api** - params: {"method": "GET/POST", "url": "API地址", "headers": {}, "body": {}, "description": "API调用说明"}
 14. **compare_api_vs_page** - params: {"description": "对比说明", "api_data": "接口数据", "page_data": "页面数据"}
-15. **finish** - params: {"summary": "测试总结"}
-16. **request_human_input** - params: {"title": "标题", "description": "说明", "placeholder": "占位符"}
+15. **switch_tab** - params: {"index": 标签页索引，-1表示最新}  — 切换到指定标签页（window.open 打开新标签页后系统会自动切换，通常用于切回原标签页）
+16. **close_tab** - params: {"index": -1}  — 关闭指定标签页并切回上一个（-1表示当前标签页）
+17. **get_tabs** - params: {}  — 查看所有打开的标签页列表
+18. **go_back** - params: {}  — 浏览器后退（等同点击浏览器后退按钮）
+19. **send_keys** - params: {"keys": "Tab Tab Enter"}  — 发送键盘按键序列（空格分隔），当按钮无法点击时可用键盘导航，支持 Tab/Enter/Escape/ArrowDown/ArrowUp/Space 等（注意：发送空格键请用 "Space" 而非空格字符）
+20. **execute_js** - params: {"expression": "JavaScript代码", "description": "说明"}  — 在页面上下文执行 JS，可用于操作 localStorage/sessionStorage（如清除 token）、读取页面状态等
+21. **finish** - params: {"summary": "测试总结"}
+22. **request_human_input** - params: {"title": "标题", "description": "说明", "placeholder": "占位符"}
 
 ## 重要规则
 1. **使用 ref 引用**：所有元素交互（click、fill、type、hover 等）必须通过 ref ID（如 e0、e5、e12）引用元素，不要使用 CSS 选择器或 XPath。
@@ -79,7 +99,7 @@ text: "页面可读文本内容..."
    - P1: 功能异常但不阻断
    - P2: 体验问题或非核心异常
 5. 每一步操作后系统会自动截图作为证据
-6. **只有当功能预期文档中的所有功能流程都已测试完毕后**，才能使用 finish 操作结束。完成一个流程后，必须继续测试下一个流程，不要提前结束
+6. **finish 条件极其严格**：只有当功能预期文档中的**所有流程的所有子步骤**都已实际执行并验证后，才能使用 finish。仅仅"看到页面"或"进入了某页面"不等于测试通过——你必须按文档中描述的每一步操作（点击、填写、断言预期结果）都实际执行过。如果某个流程有 5 个子节（如 3.1-3.5），你必须逐个执行完所有子节才能标记该流程 passed
 7. **下拉菜单操作**：当需要从下拉菜单选择选项时，必须分两步：先 click 下拉触发元素展开列表，等下一步 snapshot 后再 click 目标选项的 ref。**不要在输入框中手动输入下拉菜单应选择的值**
 8. **fill 只填纯值**：例如手机号只填数字（如 15912345678），不要加国家区号前缀
 9. 如果 refs 列表中没有你需要的元素，可能需要先 scroll 或 click 展开隐藏区域，然后等待下一步 snapshot 刷新
@@ -89,9 +109,11 @@ text: "页面可读文本内容..."
 13. **跳过标记**：功能预期文档中标有 `[SKIP]` 的章节表示该功能暂不可用，必须完全跳过，不要测试该节的任何步骤
 14. **不要轻易放弃**：如果导航或操作失败，尝试其他方法（如点击页面上的链接/按钮、滚动页面寻找入口、返回上一页重试等）。只有在尝试了 3 种以上不同方法后仍然失败，才能记录问题并跳过该功能继续测试下一个流程。绝不要因为单个功能失败就 finish 整个测试
 15. **搜索/筛选后必须恢复**：测试搜索或筛选功能后，必须清空搜索框（用 fill 填入空字符串 ""）并恢复筛选条件为默认值，确保列表显示完整数据后再继续后续流程。不要在搜索/筛选状态下判断列表是否为空
-16. **严格按文档顺序执行**：必须严格按照功能预期文档中的章节顺序（流程一→流程二→流程三…）依次测试。每个流程内部也必须按照子节顺序执行（2.1→2.2→2.3…）。完成当前流程的所有子节后，才能进入下一个流程。不要跳跃、穿插或提前测试后面的流程
+16. **严格按文档顺序、深入执行每个子流程**：必须严格按照功能预期文档中的章节顺序（流程一→流程二→流程三…）依次测试。**每个流程内部必须按子节顺序逐一执行**（如 3.1→3.2→3.3→…→3.9），每个子节中描述的每一步操作都要实际执行（不能跳过）。只有当前流程的所有子节都执行完毕后，才能进入下一个流程。**严禁跳跃**：不要在测完流程三的 3.2 后就跳去流程五，必须先完成 3.3、3.4…3.9。如果某个子节因为数据条件不满足而无法执行（如没有失败任务无法测重试），记录跳过原因后继续下一个子节，但不要跳到其他流程
 17. **ref 会随页面变化重新分配**：当页面 DOM 发生变化时（弹出对话框/模态框、关闭弹窗、Tab 切换、导航跳转、列表刷新等），所有 ref ID 会被重新分配。**绝对不要**记住或复用上一步的 ref ID，必须根据当前步骤给你的最新 refs 列表来确定操作目标。例如：上一步点击按钮 ref=e4 打开了对话框，对话框内的输入框在新的 refs 中可能是 e0 或 e1，不再是 e4。每一步都要重新阅读 refs 列表！
 18. **不要重复报告相同问题**：如果你在之前的步骤中已经报告过某个 issue（相同 title），不要再次将它添加到 found_issues 中
+19. **clickable 角色**：refs 列表中角色为 `clickable` 的元素是页面上带有 cursor:pointer 样式的可点击区域（如项目卡片预览图、可点击的标题等）。它们不是标准的 button 或 link，但可以正常使用 click 操作。当你需要进入详情页、点击卡片等场景时，优先查找 clickable 角色的元素
+20. **子节阻塞时果断跳过**：如果系统提示你在某个子节上卡住了（连续多步失败或无进展），你必须立即：① 在 found_issues 中记录该子节的阻塞原因（如"按钮无响应"、"Popover 未弹出"等）；② 保持 flow_status=testing（单个子节失败不等于整个流程失败）；③ 将 checklist_item 更新为当前流程的下一个子节编号，继续测试。**不要在同一个子节上反复尝试超过 5 步**——把步数留给其他未测试的功能更有价值
 
 只返回 JSON，不要其他内容。"""
 
@@ -236,14 +258,23 @@ class LLMEngine:
         hint = f"（下拉列表共 {len(options)} 个选项，已过滤显示 {len(filtered_options)} 个相关项。如需选择其他选项，请用包含目标文字的关键词描述）"
         return result, hint
 
-    def decide(self, page_state, evidence, step, extra_context="", recent_api_responses=None):
+    def decide(self, page_state, evidence, step, extra_context="", recent_api_responses=None, flow_progress=None):
         refs = page_state.get("refs", [])
         truncated_refs, refs_hint = self._smart_truncate_refs(refs)
         refs_str = json.dumps(truncated_refs, ensure_ascii=False) if truncated_refs else "[]"
         if refs_hint:
             refs_str += f"\n{refs_hint}"
         page_text = page_state.get("text", "")[:1500]
-        obs = f"## 第 {step} 步观察\n\n**页面URL**: {page_state.get('url','')}\n**页面标题**: {page_state.get('title','')}\n\n**可交互元素 (Accessibility Tree refs)**:\n{refs_str}\n\n**页面文本**:\n{page_text}\n\n"
+        obs = f"## 第 {step} 步观察\n\n**页面URL**: {page_state.get('url','')}\n**页面标题**: {page_state.get('title','')}\n"
+        # 多标签页信息
+        tab_info = page_state.get("tabs")
+        if tab_info and len(tab_info) > 1:
+            tab_lines = []
+            for t in tab_info:
+                marker = "→" if t.get("active") else " "
+                tab_lines.append(f"  {marker} [{t['index']}] {t['url']}")
+            obs += f"\n**标签页**（共 {len(tab_info)} 个，→ 为当前）:\n" + "\n".join(tab_lines) + "\n"
+        obs += f"\n**可交互元素 (Accessibility Tree refs)**:\n{refs_str}\n\n**页面文本**:\n{page_text}\n\n"
         if evidence.get("new_console_errors"):
             obs += f"**新 Console 错误**:\n{json.dumps(evidence['new_console_errors'], ensure_ascii=False)}\n\n"
         if evidence.get("new_network_errors"):
@@ -252,6 +283,20 @@ class LLMEngine:
             obs += f"**最近拦截到的 API 响应**:\n{json.dumps(recent_api_responses[:5], ensure_ascii=False)}\n\n"
         if extra_context:
             obs += f"**额外上下文**:\n{extra_context}\n\n"
+        # 注入流程进度摘要（每步都注入，防止 Agent 重复已完成的操作）
+        if flow_progress:
+            progress_lines = []
+            completed = flow_progress.get("completed_flows", [])
+            failed = flow_progress.get("failed_flows", [])
+            done_items = flow_progress.get("done_items_in_current_flow", [])
+            if completed:
+                progress_lines.append(f"✅ 已通过流程：{', '.join(completed)}")
+            if failed:
+                progress_lines.append(f"❌ 未通过流程：{'; '.join(f.get('flow','') for f in failed)}")
+            if done_items:
+                progress_lines.append(f"📋 当前流程已完成子节（共{len(done_items)}项，不要重复）：" + "、".join(done_items[-10:]))
+            if progress_lines:
+                obs += "**测试进度**:\n" + "\n".join(progress_lines) + "\n\n"
         obs += "请决定下一步操作。只返回 JSON。"
         self.messages.append({"role": "user", "content": obs})
 
@@ -263,15 +308,70 @@ class LLMEngine:
             print(f"[DEBUG][Step {step}] extra_context: {extra_context}")
         print(f"[DEBUG] messages 数量: {len(self.messages)}, 总字符: {sum(len(m.get('content','')) for m in self.messages)}")
 
-        # 消息历史过长时裁剪
+        # 消息历史过长时压缩（提取被删消息中的操作摘要，而非直接丢弃）
         total_chars = sum(len(m.get('content', '')) for m in self.messages)
         if total_chars > 80000 and len(self.messages) > 10:
             preserved = self.messages[:3]
-            recent = self.messages[-16:]
-            trimmed_count = len(self.messages) - 3 - 16
-            summary_msg = {"role": "user", "content": f"[系统提示：为节省 token，已省略中间 {trimmed_count} 条对话记录。请基于最近的上下文继续测试。]"}
+            # 二级压缩：超长时保留更少的 recent
+            keep_recent = 12 if total_chars > 120000 else 20
+            recent = self.messages[-keep_recent:]
+            middle = self.messages[3:-keep_recent]
+            trimmed_count = len(middle)
+
+            # 从被删的 assistant 消息中提取操作摘要
+            action_summary_lines = []
+            for msg in middle:
+                if msg.get("role") != "assistant":
+                    continue
+                try:
+                    parsed = json.loads(msg["content"])
+                    act = parsed.get("action", {})
+                    act_type = act.get("type", "?")
+                    flow_name = parsed.get("current_flow", "")
+                    ci = parsed.get("checklist_item", "")
+                    status = parsed.get("flow_status", "")
+                    brief = f"  {act_type}"
+                    if ci:
+                        brief += f": {ci}"
+                    if flow_name:
+                        brief += f" [{flow_name}]"
+                    if status == "failed":
+                        brief += " ❌"
+                    action_summary_lines.append(brief)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            # 构建压缩摘要
+            progress_parts = [f"[系统提示：为节省 token，已压缩中间 {trimmed_count} 条对话记录为摘要。]"]
+            if action_summary_lines:
+                # 只保留最后 30 条操作摘要
+                if len(action_summary_lines) > 30:
+                    progress_parts.append(f"（前 {len(action_summary_lines) - 30} 步已省略）")
+                    action_summary_lines = action_summary_lines[-30:]
+                progress_parts.append("被压缩期间的操作序列：")
+                progress_parts.extend(action_summary_lines)
+
+            if flow_progress:
+                completed = flow_progress.get("completed_flows", [])
+                failed = flow_progress.get("failed_flows", [])
+                current = flow_progress.get("current_flow", "")
+                if completed:
+                    progress_parts.append(f"\n✅ 已通过的流程（不要重复测试）：{', '.join(completed)}")
+                if failed:
+                    failed_desc = "; ".join([f"{f.get('flow','')}: {f.get('reason','')}" for f in failed])
+                    progress_parts.append(f"❌ 未通过的流程：{failed_desc}")
+                if current:
+                    progress_parts.append(f"📍 当前正在测试：{current}")
+                done_items = flow_progress.get("done_items_in_current_flow", [])
+                if done_items:
+                    progress_parts.append(f"📋 当前流程已完成的子节（不要重复执行）：")
+                    for item in done_items[-15:]:
+                        progress_parts.append(f"  ✓ {item}")
+                progress_parts.append("请继续测试尚未完成的子节和流程，不要重复已完成的操作。")
+            summary_msg = {"role": "user", "content": "\n".join(progress_parts)}
             self.messages = preserved + [summary_msg] + recent
-            print(f"[DEBUG][Step {step}] 消息历史裁剪: 删除 {trimmed_count} 条，剩余 {len(self.messages)} 条")
+            new_chars = sum(len(m.get('content', '')) for m in self.messages)
+            print(f"[DEBUG][Step {step}] 历史压缩: {trimmed_count} 条→摘要, {total_chars}→{new_chars} 字符, 保留 {len(self.messages)} 条")
 
         # 带重试的 LLM 调用
         max_retries = 3
@@ -338,6 +438,11 @@ class LLMEngine:
 - 拦截 API 响应: {evidence_summary.get('total_api_responses_captured', 0)} 个
 - Console 错误详情: {json.dumps(evidence_summary.get('console_errors', [])[:10], ensure_ascii=False)}
 - Network 错误详情: {json.dumps(evidence_summary.get('network_errors', [])[:10], ensure_ascii=False)}
+
+## Token 用量
+- 输入 tokens: {self.total_input_tokens:,}
+- 输出 tokens: {self.total_output_tokens:,}
+- 总计 tokens: {self.total_input_tokens + self.total_output_tokens:,}
 
 ## 数据验证记录
 {json.dumps(data_checks, ensure_ascii=False) if data_checks else '无数据验证'}

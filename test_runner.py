@@ -9,7 +9,9 @@ import time
 import queue
 import datetime
 import traceback
+import re
 import base64
+import hashlib
 
 from config import (
     SCREENSHOT_DIR, REPORT_DIR, LOG_DIR, SNAPSHOT_DIR, VIDEO_DIR,
@@ -69,6 +71,64 @@ def restore_session_cookies(bridge, target_url):
 
 
 # ============================================================
+# 动态最小步数估算
+# ============================================================
+
+def estimate_min_steps(spec_content: str) -> int:
+    """
+    从功能预期文档中解析流程结构，动态计算最小步数。
+    解析规则：
+    - `## 流程N` → 流程
+    - `### N.M` → 子节
+    - `N. ` 开头的行 → 实际操作步骤（排除"预期结果"、"异常"等描述行）
+    - 标有 [SKIP] 的章节不计入
+    最终取：所有子节的操作步骤总数 × 0.6（并非每步都需要独立 action，
+    如"预期结果"是观察而非操作），下限为 MIN_STEPS_BEFORE_FINISH 兜底值。
+    """
+    lines = spec_content.split("\n")
+    total_action_steps = 0
+    in_skip = False
+    current_section_steps = 0
+
+    for line in lines:
+        stripped = line.strip()
+        # 检测流程级标题
+        if stripped.startswith("## "):
+            in_skip = "[SKIP]" in stripped or "[skip]" in stripped
+            if current_section_steps > 0:
+                total_action_steps += current_section_steps
+                current_section_steps = 0
+            continue
+        # 检测子节标题
+        if stripped.startswith("### "):
+            in_skip = in_skip or "[SKIP]" in stripped or "[skip]" in stripped
+            if current_section_steps > 0:
+                total_action_steps += current_section_steps
+                current_section_steps = 0
+            continue
+        if in_skip:
+            continue
+        # 统计编号步骤行（如 "1. xxx"、"2. xxx"），排除纯描述行
+        if re.match(r"^\d+\.\s+", stripped):
+            # 跳过"预期结果"和"异常"描述行——这些是观察，不需要独立 action
+            lower = stripped.lower()
+            if "预期结果" in stripped or "异常" in stripped:
+                continue
+            current_section_steps += 1
+
+    # 别忘了最后一个子节
+    total_action_steps += current_section_steps
+
+    # 每个操作步骤大约对应 1 个 Agent action（有些步骤如 fill+click 可能需要多步）
+    # 乘以 0.8 作为合理预期（部分步骤可因条件不满足而跳过）
+    estimated = int(total_action_steps * 0.8)
+    fallback = MIN_STEPS_BEFORE_FINISH
+    result = max(estimated, fallback)
+    print(f"[INFO] 文档解析：共 {total_action_steps} 个操作步骤 → 动态最小步数 = {result}（估算 {estimated}，兜底 {fallback}）")
+    return result
+
+
+# ============================================================
 # 公共测试循环
 # ============================================================
 
@@ -77,7 +137,7 @@ def _test_loop(
     action_history, all_issues, start_step, extra_context,
     augmented_spec, login_info, api_doc,
     current_flow_name, completed_flows,
-    config,
+    config, min_steps=None,
 ):
     """
     公共测试主循环，由 run_test_task 和 resume_test_task 共用。
@@ -89,12 +149,25 @@ def _test_loop(
     def emit(event_type, data):
         log_queue.put({"type": event_type, "data": data, "timestamp": datetime.datetime.now().isoformat()})
 
+    # 动态最小步数：优先用传入值，否则用配置兜底值
+    effective_min_steps = min_steps if min_steps else MIN_STEPS_BEFORE_FINISH
+
     last_cc, last_nc, last_api = 0, 0, 0
     step = start_step
     consecutive_fails = 0
     consecutive_same = 0
     consecutive_waits = 0
     last_action_key = ""
+    failed_flows = task.get("_failed_flows", [])  # [{"flow": "...", "reason": "..."}]
+
+    # 子流程卡死检测（基于操作模式而非 checklist_item 文本）
+    SUB_FLOW_STUCK_WINDOW = 4   # 回看最近 N 步（从 6 降到 4，更快检测卡死）
+    SUB_FLOW_STUCK_CLICK_RATIO = 0.75  # 最近 N 步中 click 操作占比 >= 此值视为重复
+    stuck_skip_cooldown = 0  # 触发跳过后的冷却步数，避免连续注入
+    stuck_flow_hit_count = {}  # {flow_name: int} 每个流程被检测到卡死的次数
+    # State Hash：基于页面状态（URL + refs 签名）检测「操作无效果」
+    recent_state_hashes = []  # 最近 N 步的 (url, refs_hash) 元组
+    STATE_HASH_STUCK_THRESHOLD = 3  # 连续 N 步页面状态无变化视为卡死
 
     while step < MAX_STEPS:
         # 检查是否被取消
@@ -119,6 +192,23 @@ def _test_loop(
         time.sleep(1)  # 等待页面渲染稳定
         page_state = extract_page_state(bridge)
         emit("log", {"message": f"页面状态: url={page_state.get('url','')}, refs={len(page_state.get('refs',[]))}个, text={len(page_state.get('text',''))}字符"})
+
+        # State Hash：记录页面状态签名，用于检测「操作无效果」
+        refs_sig = hashlib.md5(
+            json.dumps([(r.get('role',''), r.get('name','')) for r in page_state.get('refs', [])], sort_keys=True).encode()
+        ).hexdigest()[:8]
+        current_state_hash = (page_state.get('url', ''), refs_sig)
+        recent_state_hashes.append(current_state_hash)
+        if len(recent_state_hashes) > 10:
+            recent_state_hashes = recent_state_hashes[-10:]
+        # 检测连续 N 步页面状态完全无变化 → 注入提醒
+        if len(recent_state_hashes) >= STATE_HASH_STUCK_THRESHOLD:
+            last_n = recent_state_hashes[-STATE_HASH_STUCK_THRESHOLD:]
+            if len(set(last_n)) == 1 and step > start_step + STATE_HASH_STUCK_THRESHOLD:
+                extra_context += (
+                    f"\n⚠️ 系统检测到最近 {STATE_HASH_STUCK_THRESHOLD} 步操作后页面状态完全没有变化（URL 和元素列表均相同）。"
+                    f"你的操作可能没有产生任何效果。请分析原因并尝试完全不同的操作方式，或跳过当前子步骤。"
+                )
         new_evidence = evidence.get_new_evidence_since(last_cc, last_nc)
         last_cc = len(evidence.console_errors)
         last_nc = len(evidence.network_errors)
@@ -133,6 +223,11 @@ def _test_loop(
                 and not last_two[-2].get("result", {}).get("success")
                 and last_two[-1].get("action") == last_two[-2].get("action")):
                 extra_context += "\n⚠️ 你已经连续两次执行相同的操作且都失败了。请不要重复相同操作，分析失败原因后尝试不同的方法。"
+        # 检测同一流程花费过多步数，提醒快速失败
+        if current_flow_name and len(action_history) >= 15:
+            flow_steps = sum(1 for a in action_history[-20:] if a.get("flow", "") == current_flow_name)
+            if flow_steps >= 15:
+                extra_context += f"\n⚠️ 你已经在「{current_flow_name}」上花费了 {flow_steps} 步以上。如果核心功能确实无法工作（如页面空白、按钮无响应），请将其标记为失败（flow_status=failed），记录 Bug，然后立即跳到下一个流程。不要反复尝试。"
         # 把上一步结果也告诉 LLM
         if action_history:
             last_entry = action_history[-1]
@@ -142,19 +237,40 @@ def _test_loop(
 
         # 思考
         emit("thinking", {"step": step, "message": "LLM 正在分析页面状态并决策..."})
-        decision = llm.decide(page_state, new_evidence, step, extra_context, recent_api if recent_api else None)
+        # 从 action_history 提取当前流程已完成的子节（去重）
+        done_items_in_flow = []
+        seen_items = set()
+        for a in action_history:
+            if a.get("flow") == (current_flow_name or flow):
+                ci = a.get("checklist_item", "")
+                ok = a.get("result", {}).get("success")
+                if ci and ok and ci not in seen_items:
+                    seen_items.add(ci)
+                    done_items_in_flow.append(ci)
+        flow_progress = {
+            "completed_flows": completed_flows,
+            "failed_flows": failed_flows,
+            "current_flow": current_flow_name,
+            "done_items_in_current_flow": done_items_in_flow[-20:],  # 最近 20 个
+        }
+        decision = llm.decide(page_state, new_evidence, step, extra_context, recent_api if recent_api else None, flow_progress=flow_progress)
         extra_context = ""
         emit("token_update", {"input": llm.total_input_tokens, "output": llm.total_output_tokens})
 
         thinking = decision.get("thinking", "")
-        action = decision.get("action", {})
-        if isinstance(action, list) and len(action) > 0:
-            remaining = action[1:]
-            action = action[0] if isinstance(action[0], dict) else {"type": "wait", "params": {"ms": 1000}}
-            if remaining:
-                extra_context = f"你上一步计划了 {len(remaining)+1} 个操作，系统只执行了第一个。请在后续步骤中依次执行剩余操作：{json.dumps(remaining, ensure_ascii=False)[:500]}"
-        elif not isinstance(action, dict):
-            action = {"type": "wait", "params": {"ms": 1000}}
+        # 支持批量操作：优先读取 actions 数组，fallback 到 action 单字段
+        action_list = decision.get("actions") or []
+        if not isinstance(action_list, list) or not action_list:
+            single = decision.get("action", {})
+            if isinstance(single, list) and single:
+                action_list = [a for a in single if isinstance(a, dict)]
+            elif isinstance(single, dict):
+                action_list = [single]
+            else:
+                action_list = [{"type": "wait", "params": {"ms": 1000}}]
+        # 限制最多 4 个，防止 LLM 输出过多
+        action_list = action_list[:4]
+        action = action_list[0]  # 主 action 用于后续 flow/status 处理
         issues = decision.get("found_issues", [])
         if not isinstance(issues, list):
             issues = []
@@ -164,10 +280,81 @@ def _test_loop(
         next_plan = decision.get("next_plan", "")
         checklist_item = decision.get("checklist_item", "")
 
+        # ---- 子流程卡死检测（基于操作模式） ----
+        # 不依赖 checklist_item 文本匹配（Agent 每步描述都不同），
+        # 而是分析最近 N 步的实际行为模式：同一流程内反复 click 且页面无变化
+        if stuck_skip_cooldown > 0:
+            stuck_skip_cooldown -= 1
+        elif len(action_history) >= SUB_FLOW_STUCK_WINDOW:
+            recent = action_history[-SUB_FLOW_STUCK_WINDOW:]
+            # 条件 1：最近 N 步都在同一个流程
+            recent_flows = [a.get("flow", "") for a in recent]
+            same_flow = len(set(f for f in recent_flows if f)) <= 1
+            # 条件 2：大部分是 click 操作（排除 fill/assert 等有意义的操作）
+            click_count = sum(1 for a in recent if a.get("action", {}).get("type") in ("click", "close_tab", "switch_tab"))
+            click_ratio = click_count / len(recent)
+            # 条件 3：有失败或包含 finish 被拒绝
+            fail_count = sum(1 for a in recent if not a.get("result", {}).get("success"))
+            finish_rejects = sum(1 for a in recent if a.get("action", {}).get("type") == "finish" and not a.get("result", {}).get("success"))
+            # 条件 4：页面 URL 基本没变（Agent 没有导航到新页面）
+            recent_urls = [a.get("result", {}).get("url", "") for a in recent if a.get("result", {}).get("url")]
+            url_unchanged = len(set(recent_urls)) <= 2  # 允许最多 2 个不同 URL（如新标签页跳转后切回）
+
+            # 条件 5（新增）：导航循环检测 — Agent 反复在 2 个 URL 间来回跳（即使全部成功）
+            nav_loop = False
+            if len(recent_urls) >= 4:
+                # 检测 A→B→A→B 模式：URL 只有 2 种且交替出现
+                unique_urls = set(recent_urls)
+                nav_loop = len(unique_urls) == 2 and click_ratio >= 0.6
+
+            is_stuck = (same_flow
+                        and click_ratio >= SUB_FLOW_STUCK_CLICK_RATIO
+                        and (fail_count >= 2 or finish_rejects >= 1 or nav_loop)
+                        and url_unchanged)
+
+            if is_stuck:
+                stuck_flow = current_flow_name or flow
+                stuck_flow_hit_count[stuck_flow] = stuck_flow_hit_count.get(stuck_flow, 0) + 1
+                hits = stuck_flow_hit_count[stuck_flow]
+                skip_msg = f"在「{stuck_flow}」中检测到操作模式卡死（第 {hits} 次，最近 {SUB_FLOW_STUCK_WINDOW} 步：{click_count} 次点击，{fail_count} 次失败）"
+                print(f"[WARN][Step {step}] {skip_msg}")
+                emit("log", {"message": f"🚫 {skip_msg}，系统强制跳过"})
+                if hits >= 2:
+                    # 同一流程第二次卡死，强制跳到下一个流程
+                    extra_context += (
+                        f"\n\n🚫🚫 **系统第 {hits} 次检测到你在「{stuck_flow}」卡死！**\n"
+                        f"**你必须立即放弃整个「{stuck_flow}」**，执行以下操作：\n"
+                        f"1. 将 flow_status 设为 failed，在 found_issues 中记录阻塞原因\n"
+                        f"2. **立即切换到下一个流程**（如从流程三跳到流程四），更新 current_flow\n"
+                        f"3. 不要再回到「{stuck_flow}」，不要 finish，开始执行下一个流程的第一个子节\n"
+                    )
+                else:
+                    # 第一次卡死，建议跳子节
+                    extra_context += (
+                        f"\n\n🚫 **系统检测到你卡住了**（最近 {SUB_FLOW_STUCK_WINDOW} 步都在重复操作且无进展）。\n"
+                        f"**你必须立即停止当前子节的尝试**，执行以下操作：\n"
+                        f"1. 如果尚未记录，将当前阻塞问题记录到 found_issues\n"
+                        f"2. 保持 flow_status=testing（单个子节失败不等于整个流程失败）\n"
+                        f"3. **立即跳到当前流程的下一个子节**（如从 3.6 跳到 3.7）\n"
+                        f"4. 不要再尝试当前子节，不要再点击同类按钮，不要 finish\n"
+                        f"把剩余步数用于测试其他未覆盖的功能。"
+                    )
+                stuck_skip_cooldown = SUB_FLOW_STUCK_WINDOW  # 冷却 N 步
+
         # 流程切换检测：当 flow 名称变化时重置 LLM 上下文
         if flow and current_flow_name and flow != current_flow_name:
-            if current_flow_name not in completed_flows:
-                completed_flows.append(current_flow_name)
+            # 统计当前流程实际执行了多少步
+            flow_step_count = sum(1 for a in action_history if a.get("flow") == current_flow_name)
+            if flow_status == "failed" or any(i.get("flow") == current_flow_name for i in all_issues):
+                if not any(f["flow"] == current_flow_name for f in failed_flows):
+                    reason = next((i.get("title", "") for i in all_issues if i.get("flow") == current_flow_name), "未知原因")
+                    failed_flows.append({"flow": current_flow_name, "reason": reason})
+            elif current_flow_name not in completed_flows:
+                # 只有执行了足够步数（>=3）才标记为通过，否则视为未充分测试
+                if flow_step_count >= 3:
+                    completed_flows.append(current_flow_name)
+                else:
+                    print(f"[WARN][Step {step}] 流程 '{current_flow_name}' 仅执行了 {flow_step_count} 步，不标记为 completed")
             print(f"[DEBUG][Step {step}] 流程切换: '{current_flow_name}' → '{flow}'")
             emit("log", {"message": f"🔄 流程切换: {current_flow_name} → {flow}（上下文已重置）"})
             current_page_url = page_state.get("url", "")
@@ -191,6 +378,8 @@ def _test_loop(
             for issue in issues:
                 title = issue.get("title", "")
                 if title not in existing_titles:
+                    issue["flow"] = current_flow_name
+                    issue["step"] = step
                     all_issues.append(issue)
                     existing_titles.add(title)
                     emit("bug", {"severity": issue.get("severity"), "title": title, "description": issue.get("description")})
@@ -226,18 +415,62 @@ def _test_loop(
             summary = action.get("params", {}).get("summary", "致命错误")
             print(f"[FATAL][Step {step}] {summary}")
             emit("log", {"message": f"❌ 致命错误: {summary}，测试终止"})
-            all_issues.append({"severity": "P0", "title": "API 致命错误", "description": summary})
+            all_issues.append({"severity": "P0", "title": "API 致命错误", "description": summary, "flow": flow, "step": step})
             action_history.append({"step": step, "thinking": thinking, "action": action, "result": {"success": False, "message": summary}, "flow": flow, "flow_status": flow_status, "checklist_item": checklist_item})
             emit("step_result", {"step": step, "success": False, "message": summary, "action_type": "fatal_error"})
             break
 
         # 处理 finish
         if action.get("type") == "finish":
-            if step < MIN_STEPS_BEFORE_FINISH:
-                print(f"[WARN][Step {step}] LLM 尝试过早结束（< {MIN_STEPS_BEFORE_FINISH} 步），要求继续测试")
-                extra_context = "系统拒绝了你的 finish 请求。功能预期文档中还有未测试的功能流程。请回顾文档，找到还没测试的流程继续测试。如果某个功能无法访问，请跳过它并测试下一个功能，不要结束整个测试。"
-                action_history.append({"step": step, "thinking": thinking, "action": action, "result": {"success": False, "message": "系统拒绝提前结束，还有未测流程"}, "flow": flow, "flow_status": flow_status, "checklist_item": checklist_item})
-                emit("step_result", {"step": step, "success": False, "message": "还有未测试的功能流程，继续测试", "action_type": "finish"})
+            # 检查步数下限（使用动态计算的最小步数）
+            reject_reason = ""
+            if step < effective_min_steps:
+                reject_reason = f"步数不足（{step}/{effective_min_steps}，基于文档结构动态计算）"
+            else:
+                # 检查 1：从文档中提取所有流程名，对比是否有完全未触及的流程
+                spec_flows = re.findall(r'^##\s+(流程[一二三四五六七八九十\d]+[：:].+)', augmented_spec, re.MULTILINE)
+                # 排除 [SKIP] 标记的流程
+                spec_flows = [f.strip() for f in spec_flows if '[SKIP]' not in f and '[skip]' not in f]
+                touched_flows = set(completed_flows) | set(f.get("flow", "") for f in failed_flows) | set(a.get("flow", "") for a in action_history if a.get("flow"))
+                untouched = [f for f in spec_flows if not any(f in t or t in f for t in touched_flows)]
+                if untouched:
+                    reject_reason = f"以下流程完全未测试：{', '.join(untouched)}。必须先测试这些流程才能结束"
+                else:
+                    # 检查 2：已触及的流程中是否有操作不足的
+                    from collections import Counter
+                    flow_step_counts = Counter(a.get("flow", "") for a in action_history if a.get("flow"))
+                    shallow_flows = [f for f, c in flow_step_counts.items() if c < 3]
+                    untested_ratio = len(shallow_flows) / max(len(flow_step_counts), 1)
+                    if shallow_flows and untested_ratio > 0.3:
+                        reject_reason = f"流程覆盖不足：以下流程操作不足3步，疑似未深入测试：{', '.join(shallow_flows)}"
+            if reject_reason:
+                print(f"[WARN][Step {step}] LLM 尝试过早结束: {reject_reason}")
+                # 统计当前流程已完成的子节数量
+                done_in_flow = set()
+                for a in action_history:
+                    if a.get("flow") == flow and a.get("result", {}).get("success") and a.get("checklist_item"):
+                        done_in_flow.add(a["checklist_item"])
+                # 判断：当前流程是否已标记为 failed 且子节充分（>=5 个不同子节）
+                current_flow_in_failed = any(f.get("flow") == flow for f in failed_flows)
+                flow_exhausted = current_flow_in_failed and len(done_in_flow) >= 5
+                if flow_exhausted or (flow_status == "failed" and len(done_in_flow) >= 5):
+                    # 当前流程确实做了足够多的子节且被标记失败，允许跳到下一个流程
+                    extra_context = (
+                        f"系统拒绝了你的 finish 请求。原因：{reject_reason}。\n"
+                        f"当前流程「{flow}」已标记失败且已测试 {len(done_in_flow)} 个子节。\n"
+                        f"请跳到**下一个流程**（更新 current_flow），从该流程的第一个子节开始测试。"
+                    )
+                else:
+                    # 当前流程还有未完成的子节，不要跳走
+                    extra_context = (
+                        f"系统拒绝了你的 finish 请求。原因：{reject_reason}。\n"
+                        f"当前流程「{flow}」只完成了 {len(done_in_flow)} 个子节，还有很多子节未测试。\n"
+                        f"**不要跳到下一个流程**，请继续测试当前流程中尚未完成的子节。\n"
+                        f"遇到某个子节的问题（如页面加载失败），记录 Bug 后跳过该子节，继续测试同一流程的下一个子节。\n"
+                        f"回顾功能预期文档，找到当前流程中还没执行的子步骤，逐一操作验证。"
+                    )
+                action_history.append({"step": step, "thinking": thinking, "action": action, "result": {"success": False, "message": f"系统拒绝: {reject_reason}"}, "flow": flow, "flow_status": flow_status, "checklist_item": checklist_item})
+                emit("step_result", {"step": step, "success": False, "message": f"finish 被拒绝: {reject_reason}", "action_type": "finish"})
                 step += 1
                 continue
             # 最终截图
@@ -248,10 +481,31 @@ def _test_loop(
             emit("step_result", {"step": step, "success": True, "message": action.get("params", {}).get("summary", "测试结束"), "action_type": "finish"})
             break
 
-        # 执行操作
-        print(f"[DEBUG][Step {step}] EXECUTE: {action.get('type')} | params={json.dumps(action.get('params',{}), ensure_ascii=False)}")
-        result = executor.execute(action)
-        print(f"[DEBUG][Step {step}] RESULT: success={result['success']} | {result['message']}")
+        # 执行操作（支持批量：action_list 可含 1~4 个 action）
+        url_before = page_state.get("url", "")
+        batch_results = []
+        for act_idx, act in enumerate(action_list):
+            print(f"[DEBUG][Step {step}] EXECUTE[{act_idx+1}/{len(action_list)}]: {act.get('type')} | params={json.dumps(act.get('params',{}), ensure_ascii=False)}")
+            result = executor.execute(act)
+            print(f"[DEBUG][Step {step}] RESULT[{act_idx+1}/{len(action_list)}]: success={result['success']} | {result['message']}")
+            batch_results.append((act, result))
+            # 批量中某个失败则停止后续
+            if not result['success']:
+                break
+            # 如果 URL 发生变化（导航/跳转），停止后续批量操作
+            try:
+                url_now = bridge._page.url
+                if url_now != url_before:
+                    if act_idx < len(action_list) - 1:
+                        print(f"[DEBUG][Step {step}] 批量操作中检测到 URL 变化，停止后续操作")
+                    break
+            except:
+                pass
+        # 用最后一个实际执行的 action 和 result 作为本步的代表
+        action, result = batch_results[-1]
+        if len(batch_results) > 1:
+            batch_msg = " → ".join(f"{a.get('type')}({'✓' if r['success'] else '✗'})" for a, r in batch_results)
+            result["message"] = f"[批量{len(batch_results)}步] {batch_msg} | {result['message']}"
 
         # 每步操作后自动截图
         ss = executor.take_screenshot(step, action.get("type", ""))
@@ -280,9 +534,11 @@ def _test_loop(
 
         action_history.append({
             "step": step, "thinking": thinking, "action": action,
-            "result": {"success": result["success"], "message": result["message"]},
+            "result": {"success": result["success"], "message": result["message"],
+                       "url": bridge._page.url if bridge._page else ""},
             "flow": flow, "flow_status": flow_status, "next_plan": next_plan,
             "checklist_item": checklist_item,
+            "batch_size": len(batch_results),
         })
 
         # ---- 智能终止检测 ----
@@ -337,7 +593,7 @@ def _test_loop(
             else:
                 print(f"[WARN][Step {step}] 确认卡死: {stuck_reason}，强制终止")
                 emit("log", {"message": f"⚠️ 智能终止: {stuck_reason}，停止测试"})
-                all_issues.append({"severity": "P2", "title": f"测试卡死: {stuck_reason}", "description": f"在 Step {step} 检测到 {stuck_reason}，系统自动终止测试"})
+                all_issues.append({"severity": "P2", "title": f"测试卡死: {stuck_reason}", "description": f"在 Step {step} 检测到 {stuck_reason}，系统自动终止测试", "flow": current_flow_name, "step": step})
                 break
 
         # 保存快照（用于断点续测）
@@ -355,6 +611,8 @@ def _test_loop(
             "all_issues": all_issues, "last_url": page_state.get("url", ""),
             "token_usage": {"input": llm.total_input_tokens, "output": llm.total_output_tokens},
             "browser_state": browser_state,
+            "completed_flows": completed_flows,
+            "failed_flows": failed_flows,
         }
         snapshot_path = SNAPSHOT_DIR / f"snapshot_{task_id}.json"
         try:
@@ -398,7 +656,10 @@ def _finalize_test(task_id, task, llm, bridge, executor, evidence,
     # 保存 cookies + 关闭浏览器 + 保存视频
     save_session_cookies(bridge)
     video_path = bridge.get_video_path()
-    bridge.close_tab()
+    try:
+        bridge.close_tab()
+    except (ValueError, Exception):
+        pass  # 只剩一个标签页时跳过，stop_instance 会统一关闭
     bridge.stop_instance()
     video_filename = None
     if video_path:
@@ -529,6 +790,9 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
 
             emit("log", {"message": "浏览器已启动（Playwright headless 模式），开始测试循环"})
 
+            dynamic_min_steps = estimate_min_steps(spec_content)
+            emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
+
             step, action_history, all_issues, data_checks = _test_loop(
                 task_id=task_id, task=task, llm=llm, bridge=bridge,
                 executor=executor, evidence=evidence,
@@ -536,7 +800,7 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
                 start_step=0, extra_context="",
                 augmented_spec=augmented_spec, login_info=login_info, api_doc=api_doc,
                 current_flow_name="", completed_flows=[],
-                config=config,
+                config=config, min_steps=dynamic_min_steps,
             )
         finally:
             _finalize_test(task_id, task, llm, bridge, executor, evidence,
@@ -555,7 +819,7 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
 # ============================================================
 
 def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: dict):
-    """从快照恢复测试，回退 rollback_steps 步后继续"""
+    """从快照恢复测试：精简上下文，只注入流程级状态，不恢复旧对话历史"""
     task = tasks[task_id]
     log_queue = task["log_queue"]
     config = task["config"]
@@ -565,28 +829,41 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
         log_queue.put({"type": event_type, "data": data, "timestamp": datetime.datetime.now().isoformat()})
 
     try:
-        # 恢复状态
-        saved_messages = snapshot["messages"]
+        # 从快照读取流程级状态（精简）
         saved_action_history = snapshot["action_history"]
         saved_issues = snapshot.get("all_issues", [])
         saved_step = snapshot["step"]
         saved_url = snapshot.get("last_url", "")
-        saved_tokens = snapshot.get("token_usage", {})
+        completed_flows = snapshot.get("completed_flows", [])
+        failed_flows = snapshot.get("failed_flows", [])
 
-        # 回退 rollback_steps 步
-        resume_step = max(0, saved_step - rollback_steps)
-        action_history = [a for a in saved_action_history if a["step"] <= resume_step]
-        all_issues = saved_issues
+        # 如果快照没有流程状态（旧格式快照），从 action_history 推断
+        if not completed_flows and not failed_flows:
+            for entry in saved_action_history:
+                f = entry.get("flow", "")
+                if f and entry.get("flow_status") == "passed" and f not in completed_flows:
+                    completed_flows.append(f)
 
-        # 回退 LLM messages
-        msgs_to_remove = rollback_steps * 2
-        if msgs_to_remove > 0 and len(saved_messages) > msgs_to_remove:
-            restored_messages = saved_messages[:-msgs_to_remove]
-        else:
-            restored_messages = saved_messages
+        # action_history 保留用于流程状态判断和 checklist 回放，但不注入 LLM 上下文
+        action_history = saved_action_history
+        # 清空旧 issues：恢复测试会重新验证失败流程，旧 Bug 可能已修复，不应沿用
+        all_issues = []
 
-        emit("status", {"status": "running", "message": f"从快照恢复测试（原任务 {original_task_id}，回退到 Step {resume_step}）"})
-        emit("log", {"message": f"🔄 恢复测试：从 Step {saved_step} 回退 {rollback_steps} 步到 Step {resume_step}，继续执行"})
+        # 将 failed_flows 存入 task 供 _test_loop 继续追踪
+        task["_failed_flows"] = failed_flows
+
+        emit("status", {"status": "running", "message": f"从快照恢复测试（原任务 {original_task_id}，Step {saved_step}）"})
+
+        # 构建精简的流程状态摘要
+        flow_summary_parts = []
+        if completed_flows:
+            flow_summary_parts.append(f"已通过的流程（跳过）：{', '.join(completed_flows)}")
+        if failed_flows:
+            failed_desc = "; ".join([f"{f['flow']}（原因：{f['reason']}）" for f in failed_flows])
+            flow_summary_parts.append(f"未通过需复测的流程：{failed_desc}")
+        flow_summary = "\n".join(flow_summary_parts) if flow_summary_parts else "无历史流程记录"
+
+        emit("log", {"message": f"🔄 恢复测试 | 已通过: {len(completed_flows)} 个流程 | 需复测: {len(failed_flows)} 个流程"})
 
         # 回放已完成的 checklist 给前端
         for entry in action_history:
@@ -598,27 +875,42 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
                 "action_type": entry.get("action", {}).get("type", ""),
             })
 
-        # 初始化 LLM（恢复对话历史）
+        # 构建上下文
+        spec_content = config.get("spec_content", "")
+        target_url = config.get("target_url", "")
+        need_login = config.get("need_login", False)
+        login_type = config.get("login_type", "password")
+        login_info = ""
+        if need_login:
+            if login_type == "sms":
+                login_info = f"手机验证码登录，手机号：{config.get('phone', '')}"
+            else:
+                login_info = f"账号密码登录，用户名：{config.get('username', '')}"
+        api_doc = config.get("api_doc", "")
+        augmented_spec = spec_content
+        if target_url and "http" not in spec_content[:200]:
+            augmented_spec = f"## 测试入口\n- URL：{target_url}\n\n{spec_content}"
+
+        # 初始化 LLM：全新对话，不恢复旧历史，只注入流程级状态
         llm_api_key = config.get("llm_api_key", "").strip() or None
         llm_base_url = config.get("llm_base_url", "").strip() or None
         llm_model = config.get("llm_model", "").strip() or None
         llm = LLMEngine(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
-        llm.restore_messages(restored_messages, saved_tokens.get("input", 0), saved_tokens.get("output", 0))
+        llm.init_conversation(augmented_spec, login_info, api_doc)
 
         evidence = EvidenceCollector()
         bridge = PlaywrightBridge(headless=True, video_dir=str(VIDEO_DIR))
         try:
             bridge.start_server()
             emit("log", {"message": "Playwright 浏览器已就绪（视频录制已开启）"})
-            if restore_session_cookies(bridge, saved_url or config.get("target_url", "")):
+            if restore_session_cookies(bridge, saved_url or target_url):
                 emit("log", {"message": "已恢复上次登录态（cookies）"})
 
-            navigate_url = saved_url or config.get("target_url", "about:blank")
+            navigate_url = saved_url or target_url or "about:blank"
             bridge.open_tab(navigate_url)
             evidence.attach(bridge)
             executor = ActionExecutor(bridge, SCREENSHOT_DIR, task_id)
             # SSRF 防护
-            target_url = config.get("target_url", "")
             if target_url:
                 from urllib.parse import urlparse
                 parsed = urlparse(target_url)
@@ -650,46 +942,39 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
                     print(f"[WARN] 恢复浏览器状态失败: {e}")
                     emit("log", {"message": f"⚠️ 恢复浏览器状态失败: {e}"})
 
-            emit("log", {"message": f"浏览器已导航到 {navigate_url}，从 Step {resume_step + 1} 继续测试"})
+            emit("log", {"message": f"浏览器已导航到 {navigate_url}，开始复测"})
 
-            # 构建上下文
-            spec_content = config.get("spec_content", "")
-            login_info = ""
-            need_login = config.get("need_login", False)
-            login_type = config.get("login_type", "password")
-            if need_login:
-                if login_type == "sms":
-                    login_info = f"手机验证码登录，手机号：{config.get('phone', '')}"
-                else:
-                    login_info = f"账号密码登录，用户名：{config.get('username', '')}"
-            api_doc = config.get("api_doc", "")
-            augmented_spec = spec_content
-            if target_url and "http" not in spec_content[:200]:
-                augmented_spec = f"## 测试入口\n- URL：{target_url}\n\n{spec_content}"
-
-            # 恢复已完成的流程名称
-            current_flow_name = ""
-            completed_flows = []
-            for entry in action_history:
-                f = entry.get("flow", "")
-                if f:
-                    current_flow_name = f
-                    if entry.get("flow_status") == "passed" and f not in completed_flows:
-                        completed_flows.append(f)
-
+            # 构建精简的恢复上下文（注入给 LLM 的第一条 extra_context）
+            resume_parts = [f"这是一次恢复测试（复测）。上次测试在 Step {saved_step} 结束。"]
+            resume_parts.append(f"\n{flow_summary}")
             if session_restored:
-                extra_context = f"测试已从 Step {resume_step} 恢复。浏览器的登录状态（cookies/localStorage）已从快照恢复，你应该仍然处于登录状态。请观察当前页面确认登录状态，然后继续之前未完成的测试流程。不要重复已测试过的流程。"
+                resume_parts.append("\n浏览器登录状态已从快照恢复，你应该仍然处于登录状态。")
             else:
-                extra_context = f"测试已从 Step {resume_step} 恢复。注意：浏览器是全新启动的，登录状态可能已丢失。请先观察当前页面状态，如果需要重新登录则先完成登录，然后继续之前未完成的测试流程。"
+                resume_parts.append("\n注意：浏览器是全新启动的，登录状态可能已丢失。如需要请先重新登录。")
+            if failed_flows:
+                resume_parts.append("\n请从第一个未通过的流程开始复测。已通过的流程可以跳过。")
+            else:
+                resume_parts.append("\n请继续测试上次未完成的流程。已通过的流程可以跳过。")
+            extra_context = "".join(resume_parts)
+
+            # 确定起始流程
+            current_flow_name = ""
+            if failed_flows:
+                current_flow_name = failed_flows[0]["flow"]
+            elif completed_flows:
+                current_flow_name = completed_flows[-1]
+
+            dynamic_min_steps = estimate_min_steps(spec_content)
+            emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
 
             step, action_history, all_issues, data_checks = _test_loop(
                 task_id=task_id, task=task, llm=llm, bridge=bridge,
                 executor=executor, evidence=evidence,
                 action_history=action_history, all_issues=all_issues,
-                start_step=resume_step, extra_context=extra_context,
+                start_step=saved_step, extra_context=extra_context,
                 augmented_spec=augmented_spec, login_info=login_info, api_doc=api_doc,
                 current_flow_name=current_flow_name, completed_flows=completed_flows,
-                config=config,
+                config=config, min_steps=dynamic_min_steps,
             )
         finally:
             _finalize_test(task_id, task, llm, bridge, executor, evidence,
@@ -701,3 +986,133 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
         task["status"] = "error"
         task["error"] = str(e)
         emit("error", {"message": f"恢复测试异常终止: {str(e)}"})
+
+
+# ============================================================
+# 入口三：脚本化测试（确定性操作 + AI 验证）
+# ============================================================
+
+def run_script_task(task_id: str, config: dict, tasks: dict):
+    """
+    脚本化测试入口：按 YAML 脚本顺序执行操作，AI 只做结果验证。
+    操作路径确定，元素定位由策略函数决定，大幅提升稳定性。
+    """
+    from script_runner import ScriptRunner, AIVerifier, generate_script_report
+
+    task = tasks[task_id]
+    log_queue = task["log_queue"]
+
+    target_url = config.get("target_url", "")
+    script_file = config.get("script_file", "")
+
+    def emit(event_type, data):
+        log_queue.put({"type": event_type, "data": data, "timestamp": datetime.datetime.now().isoformat()})
+
+    try:
+        emit("status", {"status": "running", "message": "脚本化测试启动中..."})
+
+        # 检查脚本文件
+        from pathlib import Path
+        script_path = Path(__file__).parent / "test_scripts" / script_file
+        if not script_path.exists():
+            raise FileNotFoundError(f"测试脚本不存在: {script_path}")
+
+        # 初始化 AI 验证器
+        llm_api_key = config.get("llm_api_key", "").strip() or None
+        llm_base_url = config.get("llm_base_url", "").strip() or None
+        llm_model = config.get("llm_model", "").strip() or None
+        verifier = AIVerifier(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+
+        evidence = EvidenceCollector()
+
+        # 启动浏览器
+        bridge = PlaywrightBridge(headless=True, video_dir=str(VIDEO_DIR))
+        bridge.start_server()
+        emit("log", {"message": "Playwright 浏览器已就绪（视频录制已开启）"})
+
+        if restore_session_cookies(bridge, target_url):
+            emit("log", {"message": "已恢复上次登录态（cookies）"})
+
+        bridge.open_tab(target_url or "about:blank")
+        evidence.attach(bridge)
+
+        # 创建共享的 ActionExecutor（含 SSRF 防护 + URL 黑名单）
+        executor = ActionExecutor(bridge, SCREENSHOT_DIR, task_id)
+        if target_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(target_url)
+            executor.allowed_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        emit("log", {"message": f"📋 加载测试脚本: {script_file}"})
+
+        # 提取 base_url
+        base_url = target_url.rstrip("/") if target_url else ""
+
+        # 执行脚本
+        runner = ScriptRunner(bridge, verifier, evidence, executor, task_id, log_queue)
+        task["status"] = "running"
+        summary = runner.run_script(str(script_path), base_url=base_url)
+
+        # 保存 cookies
+        save_session_cookies(bridge)
+
+        # 保存视频
+        video_path = bridge.get_video_path()
+        try:
+            bridge.close_tab()
+        except (ValueError, Exception):
+            pass
+        bridge.stop_instance()
+
+        video_filename = None
+        if video_path:
+            try:
+                video_filename = f"video_{task_id}.webm"
+                dest = VIDEO_DIR / video_filename
+                shutil.move(str(video_path), str(dest))
+                print(f"[INFO] 测试视频已保存 → {dest}")
+            except Exception as e:
+                print(f"[WARN] 视频保存失败: {e}")
+
+        # 生成报告
+        report = generate_script_report(summary)
+        report_filename = f"report_{task_id}.md"
+        report_path = REPORT_DIR / report_filename
+        report_path.write_text(report, encoding="utf-8")
+
+        # 保存 log
+        log_filename = f"log_{task_id}.json"
+        log_path = LOG_DIR / log_filename
+        log_data = {
+            "task_id": task_id, "mode": "script",
+            "config": {k: v for k, v in config.items() if k != "password"},
+            "start_time": task["start_time"],
+            "end_time": datetime.datetime.now().isoformat(),
+            "summary": summary,
+        }
+        log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        task["status"] = "completed"
+        task["report"] = report
+        task["report_file"] = report_filename
+        task["total_steps"] = summary["total_steps"]
+        task["issues_count"] = len(summary["issues"])
+        task["token_usage"] = summary.get("token_usage", {})
+        task["video_file"] = video_filename
+
+        emit("complete", {
+            "status": "completed", "report_file": report_filename,
+            "total_steps": summary["total_steps"],
+            "passed": summary["passed"], "failed": summary["failed"],
+            "issues_count": len(summary["issues"]),
+            "token_usage": summary.get("token_usage", {}),
+            "report_content": report,
+            "video_file": video_filename,
+        })
+
+    except Exception as e:
+        print(f"\n[FATAL] 脚本化测试异常终止:")
+        traceback.print_exc()
+        task["status"] = "error"
+        task["error"] = str(e)
+        emit("error", {"message": f"脚本化测试异常终止: {str(e)}"})

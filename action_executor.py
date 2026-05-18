@@ -11,7 +11,7 @@ import datetime
 import requests as http_requests
 
 from playwright_bridge import PlaywrightBridge
-from config import SCREENSHOT_DIR
+from config import SCREENSHOT_DIR, BLOCKED_URL_PATTERNS
 
 
 class ActionExecutor:
@@ -26,17 +26,28 @@ class ActionExecutor:
         # SSRF 防护：允许访问的 origin（由 test_runner 设置）
         self.allowed_origin = None
 
+    def _check_blocked_url(self, url):
+        """Guardrail：检查 URL 是否命中禁止模式"""
+        for pattern in BLOCKED_URL_PATTERNS:
+            if pattern in url:
+                return pattern
+        return None
+
     def take_screenshot(self, step: int, label: str = "") -> dict:
         """每步操作后自动截图，返回 base64 和文件名"""
         name = f"step_{step}_{self.task_id}"
         path = self.screenshot_dir / f"{name}.jpg"
         try:
             b64 = self.bridge.screenshot(quality=80)
+            if not b64:
+                print(f"[WARN] take_screenshot step={step}: bridge.screenshot 返回空")
+                return {"filename": "", "base64": ""}
             with open(path, "wb") as f:
                 f.write(base64.b64decode(b64))
             self.screenshot_count += 1
             return {"filename": f"{name}.jpg", "base64": b64}
-        except:
+        except Exception as ex:
+            print(f"[WARN] take_screenshot step={step} 失败: {ex}")
             return {"filename": "", "base64": ""}
 
     def _check_api_url(self, url):
@@ -61,13 +72,40 @@ class ActionExecutor:
         result = {"success": False, "message": "", "screenshot": None}
         try:
             if action_type == "navigate":
-                self.bridge.navigate(params.get("url", ""))
-                result.update(success=True, message=f"已导航到 {params.get('url', '')}")
+                url = params.get("url", "")
+                blocked = self._check_blocked_url(url)
+                if blocked:
+                    result.update(success=False, message=f"⛔ Guardrail 拦截：禁止访问包含 '{blocked}' 的 URL")
+                    return result
+                self.bridge.navigate(url)
+                result.update(success=True, message=f"已导航到 {url}")
             elif action_type == "click":
                 ref = params.get("ref", "")
+                tabs_before = len(self.bridge._pages)
                 self.bridge.click(ref)
                 time.sleep(0.5)
-                result.update(success=True, message=f"已点击: {ref}")
+                # Guardrail：click 后检查是否意外进入禁区
+                try:
+                    current_url = self.bridge._page.url
+                    blocked = self._check_blocked_url(current_url)
+                    if blocked:
+                        self.bridge._page.go_back()
+                        time.sleep(0.5)
+                        result.update(success=False, message=f"⛔ Guardrail 拦截：点击后进入禁区('{blocked}')，已自动返回")
+                        return result
+                except:
+                    pass
+                # 检测是否有新标签页打开（window.open 下载等场景）
+                tabs_after = len(self.bridge._pages)
+                if tabs_after > tabs_before:
+                    new_tab_url = ""
+                    try:
+                        new_tab_url = self.bridge._pages[-1].url
+                    except:
+                        pass
+                    result.update(success=True, message=f"已点击: {ref}（触发了新标签页打开: {new_tab_url[:120]}）")
+                else:
+                    result.update(success=True, message=f"已点击: {ref}")
             elif action_type == "fill":
                 ref = params.get("ref", "")
                 text = params.get("text", "")
@@ -146,6 +184,24 @@ class ActionExecutor:
                     result["extracted_data"] = data
                 except Exception as ex:
                     result.update(success=False, message=f"数据提取失败: {str(ex)}")
+            elif action_type == "execute_js":
+                expression = params.get("expression", "")
+                desc = params.get("description", "执行 JS")
+                if not expression:
+                    result.update(success=False, message="execute_js: expression 参数不能为空")
+                else:
+                    try:
+                        eval_result = self.bridge.evaluate(expression)
+                        js_result = eval_result.get("result")
+                        js_error = eval_result.get("error")
+                        if js_error:
+                            result.update(success=False, message=f"JS 执行出错: {js_error}")
+                        else:
+                            preview = str(js_result)[:500] if js_result is not None else "undefined"
+                            result.update(success=True, message=f"JS 执行完成 ({desc}): {preview}")
+                            result["js_result"] = js_result
+                    except Exception as ex:
+                        result.update(success=False, message=f"JS 执行失败: {str(ex)}")
             elif action_type == "verify_data":
                 check_type = params.get("check_type", "unknown")
                 desc = params.get("description", "数据验证")
@@ -183,6 +239,31 @@ class ActionExecutor:
                 compare_record = {"check_type": "api_vs_page", "description": desc, "data": {"api_data": str(api_data)[:500], "page_data": str(page_data)[:500]}, "timestamp": datetime.datetime.now().isoformat(), "layer": "api_vs_frontend", "passed": True}
                 self.data_checks.append(compare_record)
                 result.update(success=True, message=f"前后端数据对比已记录: {desc}")
+            elif action_type == "switch_tab":
+                index = params.get("index", -1)
+                tab_result = self.bridge.switch_tab(index)
+                result.update(success=True, message=f"已切换到标签页 {tab_result['tab_index']}（共 {tab_result['total_tabs']} 个），URL: {tab_result['url']}")
+            elif action_type == "close_tab":
+                index = params.get("index", -1)
+                tab_result = self.bridge.close_tab(index)
+                result.update(success=True, message=f"已关闭标签页 {tab_result['closed_index']}，切回标签页 {tab_result['current_index']}（共 {tab_result['total_tabs']} 个）")
+            elif action_type == "get_tabs":
+                tabs = self.bridge.get_tab_info()
+                tab_desc = "; ".join([f"[{t['index']}] {'*' if t['active'] else ''}{t['url']}" for t in tabs])
+                result.update(success=True, message=f"当前标签页: {tab_desc}")
+                result["tabs"] = tabs
+            elif action_type == "go_back":
+                back_result = self.bridge.go_back()
+                time.sleep(0.5)
+                result.update(success=True, message=f"已后退到 {back_result.get('url', '')}")
+            elif action_type == "send_keys":
+                keys = params.get("keys", "")
+                if not keys:
+                    result.update(success=False, message="send_keys: keys 参数不能为空")
+                else:
+                    self.bridge.send_keys(keys)
+                    time.sleep(0.3)
+                    result.update(success=True, message=f"已发送按键: {keys}")
             elif action_type == "finish":
                 result.update(success=True, message=f"测试结束: {params.get('summary', '')}")
             elif action_type == "request_human_input":
