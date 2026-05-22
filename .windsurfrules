@@ -1,0 +1,20 @@
+# AI Web Tester 项目规则
+
+## 文档联动规则
+
+当 `core-flow.md` 或 `api-docs.md` 发生任何修改时，**必须立即**检查并优化 `prompt-generate-docs.md`：
+
+1. 分析本次修改的原因（测试失败？Agent 无法定位元素？描述不够精确？）
+2. 将修改中体现的经验、模式或教训，反向写入 `prompt-generate-docs.md` 的提示词中
+3. 确保其他开发者使用该提示词生成文档时，能自动避免同类问题
+
+**示例**：
+- 如果因为纯图标按钮 name 为空而修改了 `core-flow.md` 的定位描述 → 在 `prompt-generate-docs.md` 中补充"纯图标按钮"检查项
+- 如果因为非标准可点击元素（`<div @click>`）而补充了 role=clickable 描述 → 在 `prompt-generate-docs.md` 中补充"非标准可点击元素"说明
+- 如果因为按钮数量/顺序描述不准确而修改 → 在 `prompt-generate-docs.md` 中强调"多按钮操作区必须明确数量和顺序"
+
+## 其他规则
+
+- 修改 `playwright_bridge.py` 后必须重启服务才能生效
+- 测试报告在 `reports/` 目录，被 `.gitignore` 忽略，需用 `cat` 命令读取
+- 用户偏好直接给出 git 命令而非通过工具执行

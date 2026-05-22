@@ -12,6 +12,10 @@ import requests as http_requests
 
 from playwright_bridge import PlaywrightBridge
 from config import SCREENSHOT_DIR, BLOCKED_URL_PATTERNS
+from logger import get_logger
+from exceptions import BridgeError
+
+logger = get_logger("action_executor")
 
 
 class ActionExecutor:
@@ -40,14 +44,14 @@ class ActionExecutor:
         try:
             b64 = self.bridge.screenshot(quality=80)
             if not b64:
-                print(f"[WARN] take_screenshot step={step}: bridge.screenshot 返回空")
+                logger.warning(f"take_screenshot step={step}: bridge.screenshot 返回空")
                 return {"filename": "", "base64": ""}
             with open(path, "wb") as f:
                 f.write(base64.b64decode(b64))
             self.screenshot_count += 1
             return {"filename": f"{name}.jpg", "base64": b64}
         except Exception as ex:
-            print(f"[WARN] take_screenshot step={step} 失败: {ex}")
+            logger.warning(f"take_screenshot step={step} 失败: {ex}")
             return {"filename": "", "base64": ""}
 
     def _check_api_url(self, url):
@@ -82,8 +86,12 @@ class ActionExecutor:
             elif action_type == "click":
                 ref = params.get("ref", "")
                 tabs_before = len(self.bridge._pages)
-                self.bridge.click(ref)
+                click_result = self.bridge.click(ref)
                 time.sleep(0.5)
+                # 检查 bridge.click 返回值（三级降级均失败时返回 success=False）
+                if isinstance(click_result, dict) and not click_result.get("success", True):
+                    result.update(success=False, message=click_result.get("message", f"click {ref} 失败"))
+                    return result
                 # Guardrail：click 后检查是否意外进入禁区
                 try:
                     current_url = self.bridge._page.url
@@ -93,7 +101,7 @@ class ActionExecutor:
                         time.sleep(0.5)
                         result.update(success=False, message=f"⛔ Guardrail 拦截：点击后进入禁区('{blocked}')，已自动返回")
                         return result
-                except:
+                except Exception:
                     pass
                 # 检测是否有新标签页打开（window.open 下载等场景）
                 tabs_after = len(self.bridge._pages)
@@ -101,7 +109,7 @@ class ActionExecutor:
                     new_tab_url = ""
                     try:
                         new_tab_url = self.bridge._pages[-1].url
-                    except:
+                    except Exception:
                         pass
                     result.update(success=True, message=f"已点击: {ref}（触发了新标签页打开: {new_tab_url[:120]}）")
                 else:
@@ -224,7 +232,7 @@ class ActionExecutor:
                         try:
                             resp_data = resp.json()
                             resp_preview = json.dumps(resp_data, ensure_ascii=False)[:3000]
-                        except:
+                        except (ValueError, TypeError):
                             resp_preview = resp.text[:3000]
                         api_record = {"check_type": "api_call", "description": desc, "data": {"method": method, "url": url, "status": resp.status_code, "response_preview": resp_preview[:500]}, "timestamp": datetime.datetime.now().isoformat(), "layer": "backend", "passed": resp.status_code < 400}
                         self.data_checks.append(api_record)
@@ -270,15 +278,26 @@ class ActionExecutor:
                 result.update(success=True, message="等待人工输入")
             else:
                 result["message"] = f"未知操作: {action_type}"
+        except BridgeError as e:
+            result["message"] = f"执行失败 [{action_type}]: {e}"
+            result["error_type"] = e.__class__.__name__
+            result["recoverable"] = e.recoverable
+            logger.warning(f"BridgeError [{action_type}]: {e}")
+            self._capture_error_screenshot(result)
         except Exception as e:
             result["message"] = f"执行失败 [{action_type}]: {str(e)}"
-            try:
-                err_b64 = self.bridge.screenshot(quality=60)
-                err_path = self.screenshot_dir / f"error_{self.screenshot_count}_{self.task_id}.jpg"
-                with open(err_path, "wb") as f:
-                    f.write(base64.b64decode(err_b64))
-                result["screenshot"] = err_path.name
-                self.screenshot_count += 1
-            except:
-                pass
+            logger.error(f"未预期异常 [{action_type}]: {e}", exc_info=True)
+            self._capture_error_screenshot(result)
         return result
+
+    def _capture_error_screenshot(self, result: dict):
+        """尝试在出错时截图，失败时静默忽略"""
+        try:
+            err_b64 = self.bridge.screenshot(quality=60)
+            err_path = self.screenshot_dir / f"error_{self.screenshot_count}_{self.task_id}.jpg"
+            with open(err_path, "wb") as f:
+                f.write(base64.b64decode(err_b64))
+            result["screenshot"] = err_path.name
+            self.screenshot_count += 1
+        except Exception:
+            pass

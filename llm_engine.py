@@ -9,7 +9,15 @@ import time
 import traceback
 
 from openai import OpenAI
-from config import LLM_MODEL
+from config import (
+    LLM_MODEL, LLM_MAX_RETRIES, LLM_TEMPERATURE, LLM_MAX_TOKENS,
+    LLM_RATE_LIMIT_BASE_WAIT,
+    HISTORY_COMPRESS_THRESHOLD, HISTORY_COMPRESS_THRESHOLD_L2,
+    HISTORY_KEEP_RECENT, HISTORY_KEEP_RECENT_L2, HISTORY_MAX_SUMMARY_LINES,
+)
+from logger import get_logger
+
+logger = get_logger("llm_engine")
 
 
 # ============================================================
@@ -129,6 +137,7 @@ class LLMEngine:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
+        kwargs["timeout"] = 120  # 2 分钟超时，防止 API 卡死
         self.client = OpenAI(**kwargs)
         self.model = model or LLM_MODEL
         self.messages = []
@@ -170,7 +179,7 @@ class LLMEngine:
             {"role": "user", "content": f"以下是功能预期文档：\n\n{spec_content}\n\n{summary}"},
         ]
         old_chars = sum(len(m.get('content', '')) for m in self.messages)
-        print(f"[DEBUG] 流程切换重置上下文: 已完成流程=[{flows_str}], 新消息总字符={old_chars}")
+        logger.debug(f"流程切换重置上下文: 已完成流程=[{flows_str}], 新消息总字符={old_chars}")
 
     def init_conversation(self, spec_content, login_info="", api_doc=""):
         system_msg = SYSTEM_PROMPT
@@ -214,7 +223,7 @@ class LLMEngine:
             pass
 
         # 5. 最后手段：用正则提取关键字段
-        print(f"[WARN] JSON 解析全部失败，尝试正则提取关键字段")
+        logger.warning("JSON 解析全部失败，尝试正则提取关键字段")
         action_match = re.search(r'"action"\s*:\s*(\{[^}]*\})', cleaned)
         thinking_match = re.search(r'"thinking"\s*:\s*"([^"]*)"', cleaned)
         result = {
@@ -301,19 +310,17 @@ class LLMEngine:
         self.messages.append({"role": "user", "content": obs})
 
         # DEBUG: LLM 输入
-        print(f"\n{'='*60}")
-        print(f"[DEBUG][Step {step}] LLM INPUT (obs 前500字):")
-        print(obs[:500])
+        logger.debug(f"[Step {step}] LLM INPUT (obs 前500字): {obs[:500]}")
         if extra_context:
-            print(f"[DEBUG][Step {step}] extra_context: {extra_context}")
-        print(f"[DEBUG] messages 数量: {len(self.messages)}, 总字符: {sum(len(m.get('content','')) for m in self.messages)}")
+            logger.debug(f"[Step {step}] extra_context: {extra_context}")
+        logger.debug(f"messages 数量: {len(self.messages)}, 总字符: {sum(len(m.get('content','')) for m in self.messages)}")
 
         # 消息历史过长时压缩（提取被删消息中的操作摘要，而非直接丢弃）
         total_chars = sum(len(m.get('content', '')) for m in self.messages)
-        if total_chars > 80000 and len(self.messages) > 10:
+        if total_chars > HISTORY_COMPRESS_THRESHOLD and len(self.messages) > 10:
             preserved = self.messages[:3]
             # 二级压缩：超长时保留更少的 recent
-            keep_recent = 12 if total_chars > 120000 else 20
+            keep_recent = HISTORY_KEEP_RECENT_L2 if total_chars > HISTORY_COMPRESS_THRESHOLD_L2 else HISTORY_KEEP_RECENT
             recent = self.messages[-keep_recent:]
             middle = self.messages[3:-keep_recent]
             trimmed_count = len(middle)
@@ -345,9 +352,9 @@ class LLMEngine:
             progress_parts = [f"[系统提示：为节省 token，已压缩中间 {trimmed_count} 条对话记录为摘要。]"]
             if action_summary_lines:
                 # 只保留最后 30 条操作摘要
-                if len(action_summary_lines) > 30:
-                    progress_parts.append(f"（前 {len(action_summary_lines) - 30} 步已省略）")
-                    action_summary_lines = action_summary_lines[-30:]
+                if len(action_summary_lines) > HISTORY_MAX_SUMMARY_LINES:
+                    progress_parts.append(f"（前 {len(action_summary_lines) - HISTORY_MAX_SUMMARY_LINES} 步已省略）")
+                    action_summary_lines = action_summary_lines[-HISTORY_MAX_SUMMARY_LINES:]
                 progress_parts.append("被压缩期间的操作序列：")
                 progress_parts.extend(action_summary_lines)
 
@@ -371,23 +378,20 @@ class LLMEngine:
             summary_msg = {"role": "user", "content": "\n".join(progress_parts)}
             self.messages = preserved + [summary_msg] + recent
             new_chars = sum(len(m.get('content', '')) for m in self.messages)
-            print(f"[DEBUG][Step {step}] 历史压缩: {trimmed_count} 条→摘要, {total_chars}→{new_chars} 字符, 保留 {len(self.messages)} 条")
+            logger.debug(f"[Step {step}] 历史压缩: {trimmed_count} 条→摘要, {total_chars}→{new_chars} 字符, 保留 {len(self.messages)} 条")
 
         # 带重试的 LLM 调用
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(LLM_MAX_RETRIES):
             try:
-                response = self.client.chat.completions.create(model=self.model, messages=self.messages, temperature=0.2, max_tokens=1500, response_format={"type": "json_object"})
+                response = self.client.chat.completions.create(model=self.model, messages=self.messages, temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS, response_format={"type": "json_object"})
                 if response.usage:
                     self.total_input_tokens += response.usage.prompt_tokens
                     self.total_output_tokens += response.usage.completion_tokens
                 content = response.choices[0].message.content.strip()
                 self.messages.append({"role": "assistant", "content": content})
 
-                print(f"[DEBUG][Step {step}] LLM OUTPUT:")
-                print(content[:1000])
-                print(f"[DEBUG] tokens: in={response.usage.prompt_tokens if response.usage else '?'} out={response.usage.completion_tokens if response.usage else '?'}")
-                print(f"{'='*60}\n")
+                logger.debug(f"[Step {step}] LLM OUTPUT: {content[:1000]}")
+                logger.debug(f"tokens: in={response.usage.prompt_tokens if response.usage else '?'} out={response.usage.completion_tokens if response.usage else '?'}")
 
                 parsed = self._robust_json_parse(content)
                 return parsed
@@ -396,16 +400,14 @@ class LLMEngine:
                 is_rate_limit = '429' in error_str or 'rate' in error_str.lower() or 'RPM limit' in error_str
                 is_fatal = 'balance' in error_str.lower() or 'insufficient' in error_str.lower() or '30001' in error_str
                 if is_fatal:
-                    print(f"[FATAL][Step {step}] 账户余额不足或致命错误，立即终止: {e}")
-                    traceback.print_exc()
+                    logger.critical(f"[Step {step}] 账户余额不足或致命错误，立即终止: {e}", exc_info=True)
                     return {"thinking": f"LLM API 致命错误: {error_str}", "action": {"type": "fatal_error", "params": {"summary": f"API 错误: {error_str}"}}, "found_issues": [], "current_flow": "", "flow_status": "failed", "checklist_item": "API 致命错误", "should_continue": False}
-                if is_rate_limit and attempt < max_retries - 1:
-                    wait_sec = (attempt + 1) * 15
-                    print(f"[WARN][Step {step}] Rate limit hit, 等待 {wait_sec}s 后重试 ({attempt+1}/{max_retries})")
+                if is_rate_limit and attempt < LLM_MAX_RETRIES - 1:
+                    wait_sec = (attempt + 1) * LLM_RATE_LIMIT_BASE_WAIT
+                    logger.warning(f"[Step {step}] Rate limit hit, 等待 {wait_sec}s 后重试 ({attempt+1}/{LLM_MAX_RETRIES})")
                     time.sleep(wait_sec)
                     continue
-                print(f"[ERROR][Step {step}] LLM 调用异常: {e}")
-                traceback.print_exc()
+                logger.error(f"[Step {step}] LLM 调用异常: {e}", exc_info=True)
                 if is_rate_limit:
                     return {"thinking": f"LLM API 限流，等待后重试", "action": {"type": "wait", "params": {"ms": 5000}}, "found_issues": [], "current_flow": "", "flow_status": "testing", "checklist_item": "API限流等待", "should_continue": True}
                 return {"thinking": f"LLM 调用失败: {error_str}", "action": {"type": "fatal_error", "params": {"summary": f"LLM 错误: {error_str}"}}, "found_issues": [], "current_flow": "", "flow_status": "failed", "checklist_item": "LLM 调用失败", "should_continue": False}

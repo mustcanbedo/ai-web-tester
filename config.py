@@ -30,3 +30,26 @@ COOKIES_FILE = BASE_DIR / "session_cookies.json"
 
 # tasks 过期清理：保留最近 MAX_TASKS 个任务
 MAX_TASKS = 20
+
+# ---------- 子流程卡死检测 ----------
+SUB_FLOW_STUCK_WINDOW = 4        # 回看最近 N 步检测卡死
+SUB_FLOW_STUCK_CLICK_RATIO = 0.75  # click 操作占比 >= 此值视为重复
+
+# ---------- LLM 消息历史压缩 ----------
+HISTORY_COMPRESS_THRESHOLD = 80000    # 总字符超过此值触发压缩
+HISTORY_COMPRESS_THRESHOLD_L2 = 120000  # 二级压缩阈值
+HISTORY_KEEP_RECENT = 20              # 一级压缩保留最近 N 条
+HISTORY_KEEP_RECENT_L2 = 12          # 二级压缩保留最近 N 条
+HISTORY_MAX_SUMMARY_LINES = 30       # 压缩摘要最多保留的操作行数
+
+# ---------- LLM 调用 ----------
+LLM_MAX_RETRIES = 3                  # LLM API 调用最大重试次数
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 1500
+LLM_RATE_LIMIT_BASE_WAIT = 15       # 限流时基础等待秒数（实际 = base * attempt）
+
+# ---------- 批量执行 ----------
+MAX_ACTIONS_PER_STEP = 4            # 每步最多批量执行的 action 数
+
+# ---------- 日志 ----------
+LOG_LEVEL = "DEBUG"                  # DEBUG / INFO / WARNING / ERROR

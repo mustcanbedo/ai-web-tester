@@ -11,6 +11,10 @@ import time
 import base64
 import re
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+from logger import get_logger
+from exceptions import BridgeError, ElementNotFoundError, ElementInteractionError, NavigationError, PageCrashedError
+
+logger = get_logger("playwright_bridge")
 
 
 class PlaywrightBridge:
@@ -61,10 +65,10 @@ class PlaywrightBridge:
         page.wait_for_load_state("domcontentloaded")
         self._pages.append(page)
         new_idx = len(self._pages) - 1
-        print(f"[DEBUG] 检测到新标签页: index={new_idx} url={page.url}")
+        logger.debug(f"检测到新标签页: index={new_idx} url={page.url}")
         # 自动切换到新页面
         self._switch_to_page(new_idx)
-        print(f"[DEBUG] 已自动切换到新标签页 index={new_idx}")
+        logger.debug(f"已自动切换到新标签页 index={new_idx}")
 
     def _switch_to_page(self, index: int):
         """内部方法：切换到指定索引的页面"""
@@ -182,7 +186,11 @@ class PlaywrightBridge:
             # 超时也继续，页面可能部分加载
             pass
 
-        return {"url": self._page.url, "title": self._page.title()}
+        try:
+            title = self._page.title()
+        except Exception:
+            title = ""
+        return {"url": self._page.url, "title": title}
 
     # ------------------------------------------------------------------
     # 导航
@@ -363,9 +371,9 @@ class PlaywrightBridge:
                         if inferred_name:
                             name = inferred_name
                             ref_entry["name"] = name
-                            print(f"[DEBUG] 补充按钮名称: ref={ref_id} role={role} → name='{name}' (via CDP)")
+                            logger.debug(f"补充按钮名称: ref={ref_id} role={role} → name='{name}' (via CDP)")
                 except Exception as ex:
-                    print(f"[DEBUG] 补充按钮名称失败: ref={ref_id} backendNodeId={backend_node_id} error={ex}")
+                    logger.debug(f"补充按钮名称失败: ref={ref_id} backendNodeId={backend_node_id} error={ex}")
 
             refs.append(ref_entry)
 
@@ -451,7 +459,7 @@ class PlaywrightBridge:
                 }""")
                 items = clickable_elements.get("items", []) if isinstance(clickable_elements, dict) else []
                 stats = clickable_elements.get("stats", {}) if isinstance(clickable_elements, dict) else {}
-                print(f"[DEBUG] clickable 检测统计: {stats}")
+                logger.debug(f"clickable 检测统计: {stats}")
                 if items:
                     # 逐个通过 data-ai-ref='cN' 精确匹配，避免顺序问题
                     doc = self._cdp.send("DOM.getDocument", {"depth": 0})
@@ -482,19 +490,17 @@ class PlaywrightBridge:
                             existing_bids.add(bid)
                             added += 1
                         except Exception as ex:
-                            print(f"[DEBUG] clickable element {i} ({info.get('text','')[:30]}) 获取 nodeId 失败: {ex}")
+                            logger.debug(f"clickable element {i} ({info.get('text','')[:30]}) 获取 nodeId 失败: {ex}")
                     # 清理标记
                     self._page.evaluate("document.querySelectorAll('[data-ai-ref]').forEach(el => el.removeAttribute('data-ai-ref'))")
                     if added:
-                        print(f"[DEBUG] snapshot: 额外添加 {added} 个可点击元素（Vue/React/cursor:pointer）")
+                        logger.debug(f"snapshot: 额外添加 {added} 个可点击元素（Vue/React/cursor:pointer）")
                     else:
-                        print(f"[DEBUG] snapshot: JS 检测到 {len(items)} 个可点击元素，但 0 个成功添加到 refs（全部 backendNodeId 冲突或获取失败）")
+                        logger.debug(f"snapshot: JS 检测到 {len(items)} 个可点击元素，但 0 个成功添加到 refs（全部 backendNodeId 冲突或获取失败）")
                         for info in items[:5]:
-                            print(f"[DEBUG]   - <{info['tag']}> '{info['text'][:40]}' reason={info['reason']}")
+                            logger.debug(f"  - <{info['tag']}> '{info['text'][:40]}' reason={info['reason']}")
             except Exception as e:
-                import traceback
-                print(f"[DEBUG] snapshot: 可点击元素检测失败: {e}")
-                traceback.print_exc()
+                logger.debug(f"snapshot: 可点击元素检测失败: {e}", exc_info=True)
 
         return {
             "nodes": refs,
@@ -526,7 +532,7 @@ class PlaywrightBridge:
     def _get_locator(self, ref):
         """通过 ref ID 获取 Playwright Locator（优先 CDP 精确定位，fallback get_by_role）"""
         if ref not in self._ref_map:
-            raise ValueError(f"未知的 ref: {ref}，请先调用 snapshot 刷新元素列表")
+            raise ElementNotFoundError(f"未知的 ref: {ref}，请先调用 snapshot 刷新元素列表", action="locate", ref=ref)
 
         info = self._ref_map[ref]
         backend_node_id = info.get("backendDOMNodeId")
@@ -545,12 +551,12 @@ class PlaywrightBridge:
                 })
                 locator = self._page.locator(f'[data-pw-ref="{unique_attr}"]')
                 if locator.count() == 1:
-                    print(f"[DEBUG] _get_locator({ref}): CDP 精确定位成功")
+                    logger.debug(f"_get_locator({ref}): CDP 精确定位成功")
                     return locator
                 else:
-                    print(f"[DEBUG] _get_locator({ref}): CDP 注入属性后 count={locator.count()}, fallback")
+                    logger.debug(f"_get_locator({ref}): CDP 注入属性后 count={locator.count()}, fallback")
             except Exception as e:
-                print(f"[DEBUG] _get_locator({ref}): CDP 定位异常: {e}, fallback")
+                logger.debug(f"_get_locator({ref}): CDP 定位异常: {e}, fallback")
 
         # Fallback: 使用 get_by_role 定位
         role = info["role"]
@@ -561,8 +567,8 @@ class PlaywrightBridge:
             if name:
                 locator = self._page.get_by_text(name, exact=False)
             else:
-                raise ValueError(f"ref {ref} 角色为 clickable 但无名称，无法 fallback 定位")
-            print(f"[DEBUG] _get_locator({ref}): clickable fallback, get_by_text('{name[:30]}')")
+                raise ElementNotFoundError(f"ref {ref} 角色为 clickable 但无名称，无法 fallback 定位", action="locate", ref=ref)
+            logger.debug(f"_get_locator({ref}): clickable fallback, get_by_text('{name[:30]}')")
         elif name:
             locator = self._page.get_by_role(role, name=name)
         else:
@@ -580,12 +586,12 @@ class PlaywrightBridge:
                     ref_idx += 1
             if ref_idx < count:
                 locator = locator.nth(ref_idx)
-                print(f"[DEBUG] _get_locator({ref}): get_by_role fallback, 多个匹配({count}), 取第 {ref_idx} 个")
+                logger.debug(f"_get_locator({ref}): get_by_role fallback, 多个匹配({count}), 取第 {ref_idx} 个")
             else:
                 locator = locator.first
-                print(f"[DEBUG] _get_locator({ref}): get_by_role fallback, 多个匹配({count}), idx={ref_idx} 超出, 取 first")
+                logger.debug(f"_get_locator({ref}): get_by_role fallback, 多个匹配({count}), idx={ref_idx} 超出, 取 first")
         else:
-            print(f"[DEBUG] _get_locator({ref}): get_by_role fallback, 唯一匹配")
+            logger.debug(f"_get_locator({ref}): get_by_role fallback, 唯一匹配")
 
         return locator
 
@@ -618,7 +624,7 @@ class PlaywrightBridge:
         elif kind == "send_keys":
             return self.send_keys(key or "")
         else:
-            raise ValueError(f"未知的动作类型: {kind}")
+            raise BridgeError(f"未知的动作类型: {kind}", action=kind)
 
     def _cdp_click_element(self, locator):
         """通过 CDP Input.dispatchMouseEvent 发送原生鼠标事件（比 JS dispatchEvent 更底层）"""
@@ -630,7 +636,7 @@ class PlaywrightBridge:
         # 获取元素中心坐标
         box = locator.bounding_box(timeout=3000)
         if not box:
-            raise ValueError("无法获取元素 bounding box")
+            raise ElementInteractionError("无法获取元素 bounding box", action="cdp_click")
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
         # 完整的鼠标事件序列：mouseMoved → mousePressed → mouseReleased
@@ -686,9 +692,9 @@ class PlaywrightBridge:
             }""")
             is_popup_trigger = popup_info.get('haspopup') in ('dialog', 'menu', 'true')
             if is_popup_trigger:
-                print(f"[DEBUG] click {ref}: 检测到 popup trigger (haspopup={popup_info.get('haspopup')}, state={popup_info.get('dataState')}, tag={popup_info.get('tag')})")
+                logger.debug(f"click {ref}: 检测到 popup trigger (haspopup={popup_info.get('haspopup')}, state={popup_info.get('dataState')}, tag={popup_info.get('tag')})")
         except Exception as e:
-            print(f"[DEBUG] click {ref}: popup 检测异常: {e}")
+            logger.debug(f"click {ref}: popup 检测异常: {e}")
 
         clicked_ok = False
         # ---- 降级链 ----
@@ -697,25 +703,25 @@ class PlaywrightBridge:
             locator.click(timeout=5000)
             clicked_ok = True
         except Exception as e:
-            print(f"[DEBUG] click {ref}: locator.click 失败({e})，降级为 CDP 原生点击")
+            logger.debug(f"click {ref}: locator.click 失败({e})，降级为 CDP 原生点击")
 
         # Level 2: CDP Input.dispatchMouseEvent（原生鼠标事件，绕过 hit-testing）
         if not clicked_ok:
             try:
                 self._cdp_click_element(locator)
                 clicked_ok = True
-                print(f"[DEBUG] click {ref}: CDP 原生点击成功")
+                logger.debug(f"click {ref}: CDP 原生点击成功")
             except Exception as e:
-                print(f"[DEBUG] click {ref}: CDP 点击失败({e})，降级为 el.click()")
+                logger.debug(f"click {ref}: CDP 点击失败({e})，降级为 el.click()")
 
         # Level 3: JS el.click()（最后手段，不触发 pointer 事件）
         if not clicked_ok:
             try:
                 locator.evaluate("el => el.click()")
                 clicked_ok = True
-                print(f"[DEBUG] click {ref}: el.click() 降级成功")
+                logger.debug(f"click {ref}: el.click() 降级成功")
             except Exception as e2:
-                print(f"[DEBUG] click {ref}: el.click() 也失败: {e2}")
+                logger.debug(f"click {ref}: el.click() 也失败: {e2}")
 
         # ---- Popover/DropdownMenu trigger 验证 ----
         if clicked_ok and is_popup_trigger:
@@ -723,7 +729,7 @@ class PlaywrightBridge:
             try:
                 state = self._get_popup_state(locator)
                 if state != 'open':
-                    print(f"[DEBUG] click {ref}: popup trigger 点击后 data-state={state}，用 CDP 重试")
+                    logger.debug(f"click {ref}: popup trigger 点击后 data-state={state}，用 CDP 重试")
                     try:
                         self._cdp_click_element(locator)
                     except Exception:
@@ -732,7 +738,7 @@ class PlaywrightBridge:
                     state2 = self._get_popup_state(locator)
                     if state2 != 'open':
                         # 最后尝试：keyboard Enter
-                        print(f"[DEBUG] click {ref}: CDP 重试后 data-state={state2}，尝试 focus+Enter")
+                        logger.debug(f"click {ref}: CDP 重试后 data-state={state2}，尝试 focus+Enter")
                         try:
                             locator.focus()
                             self._page.keyboard.press("Enter")
@@ -740,11 +746,11 @@ class PlaywrightBridge:
                         except Exception:
                             pass
                         state3 = self._get_popup_state(locator)
-                        print(f"[DEBUG] click {ref}: focus+Enter 后 data-state={state3}")
+                        logger.debug(f"click {ref}: focus+Enter 后 data-state={state3}")
                     else:
-                        print(f"[DEBUG] click {ref}: CDP 重试成功 data-state=open")
+                        logger.debug(f"click {ref}: CDP 重试成功 data-state=open")
             except Exception as e:
-                print(f"[DEBUG] click {ref}: data-state 检查异常: {e}")
+                logger.debug(f"click {ref}: data-state 检查异常: {e}")
 
         if not clicked_ok:
             return {"success": False, "message": f"click {ref}: 三级降级均失败"}
@@ -800,7 +806,7 @@ class PlaywrightBridge:
         try:
             self._page.go_back(wait_until="domcontentloaded", timeout=10000)
         except Exception as e:
-            print(f"[DEBUG] go_back 异常（可能无历史记录）: {e}")
+            logger.debug(f"go_back 异常（可能无历史记录）: {e}")
         return {"success": True, "url": self._page.url, "title": self._page.title()}
 
     def send_keys(self, keys):
@@ -829,7 +835,7 @@ class PlaywrightBridge:
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    print(f"[WARN] screenshot 失败(3次重试后): {ex}")
+                    logger.warning(f"screenshot 失败(3次重试后): {ex}")
                     return ""
 
     # ------------------------------------------------------------------

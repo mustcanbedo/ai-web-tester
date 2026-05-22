@@ -13,6 +13,9 @@ import queue
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from logger import get_logger
+
+logger = get_logger("app")
 import uvicorn
 
 from openai import OpenAI
@@ -57,7 +60,7 @@ def _cleanup_old_tasks():
                 except Exception:
                     pass
         del tasks[tid]
-        print(f"[INFO] 清理过期任务及文件: {tid}")
+        logger.info(f"清理过期任务及文件: {tid}")
 
 
 # ============================================================

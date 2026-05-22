@@ -1,0 +1,476 @@
+# 流程三：训练任务管理
+# 前置条件：用户已登录，已进入某个项目的训练任务页面
+
+flow: "流程三：训练任务管理"
+precondition: "user_logged_in_and_in_project"
+
+steps:
+  # ============================================================
+  # 3.1 查看训练任务列表
+  # ============================================================
+  - id: "3.1.1"
+    name: "导航到训练任务列表页"
+    action: navigate
+    params:
+      url: "{base_url}/datasets/list"
+
+  - id: "3.1.2"
+    name: "等待项目列表加载"
+    action: wait
+    params:
+      ms: 3000
+
+  - id: "3.1.3"
+    name: "点击第一个非禁止项目进入训练页面"
+    action: find_and_click
+    params:
+      strategy: by_role
+      role: clickable
+      exclude_text: "projectId=25"
+      index: 0
+
+  - id: "3.1.4"
+    name: "等待训练任务列表加载"
+    action: wait_for
+    params:
+      type: url_contains
+      value: "/training"
+      timeout: 10000
+
+  - id: "3.1.5"
+    name: "验证训练任务列表页结构"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: url_contains
+        value: "/training/list"
+      - type: ai_judge
+        question: "页面是否显示了训练任务列表？是否有类型 Tab（点云/3DGS/CAD/Mesh）？是否有'返回'按钮和数据集名称？"
+
+  # ============================================================
+  # 3.1 验证 Tab 切换
+  # ============================================================
+  - id: "3.1.6"
+    name: "切换到 3DGS Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "3DGS"
+      role: tab
+
+  - id: "3.1.7"
+    name: "验证 3DGS Tab 已切换"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: url_contains
+        value: "tab=3dgs"
+
+  - id: "3.1.8"
+    name: "切换到 Mesh Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "Mesh"
+      role: tab
+
+  - id: "3.1.9"
+    name: "验证 Mesh Tab 已切换"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: url_contains
+        value: "tab=mesh"
+
+  - id: "3.1.10"
+    name: "切回点云 Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "点云"
+      role: tab
+
+  - id: "3.1.11"
+    name: "验证点云 Tab"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: url_contains
+        value: "tab=pointcloud"
+
+  # ============================================================
+  # 3.2 创建 3DGS 训练任务
+  # ============================================================
+  - id: "3.2.1"
+    name: "切换到 3DGS Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "3DGS"
+      role: tab
+
+  - id: "3.2.2"
+    name: "等待 3DGS 列表加载"
+    action: wait
+    params:
+      ms: 2000
+
+  - id: "3.2.3"
+    name: "点击创建训练按钮"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "创建训练"
+      role: button
+
+  - id: "3.2.4"
+    name: "验证创建对话框弹出"
+    action: wait
+    params:
+      ms: 500
+    verify:
+      - type: text_visible
+        text: "创建训练任务"
+      - type: element_exists
+        role: textbox
+
+  - id: "3.2.5"
+    name: "填写任务名称"
+    action: find_and_fill
+    params:
+      strategy: by_role
+      role: textbox
+      text: "auto-3dgs-{timestamp}"
+
+  - id: "3.2.6"
+    name: "验证训练质量下拉存在"
+    action: snapshot
+    verify:
+      - type: ai_judge
+        question: "对话框中是否有'训练质量'相关选项？是否有'开始训练'按钮？"
+
+  - id: "3.2.7"
+    name: "点击开始训练"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "开始训练"
+      role: button
+
+  - id: "3.2.8"
+    name: "验证创建成功"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: ai_judge
+        question: "是否显示了'提交成功'的 toast 提示？创建对话框是否已关闭？"
+
+  # ============================================================
+  # 3.5 创建 Mesh 训练任务
+  # ============================================================
+  - id: "3.5.1"
+    name: "切换到 Mesh Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "Mesh"
+      role: tab
+
+  - id: "3.5.2"
+    name: "等待 Mesh 列表加载"
+    action: wait
+    params:
+      ms: 2000
+
+  - id: "3.5.3"
+    name: "点击创建训练按钮"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "创建训练"
+      role: button
+
+  - id: "3.5.4"
+    name: "验证创建对话框弹出"
+    action: wait
+    params:
+      ms: 500
+    verify:
+      - type: text_visible
+        text: "创建训练任务"
+
+  - id: "3.5.5"
+    name: "填写 Mesh 任务名称"
+    action: find_and_fill
+    params:
+      strategy: by_role
+      role: textbox
+      text: "auto-mesh-{timestamp}"
+
+  - id: "3.5.6"
+    name: "点击开始训练"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "开始训练"
+      role: button
+
+  - id: "3.5.7"
+    name: "验证 Mesh 任务创建成功"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: ai_judge
+        question: "是否显示了'提交成功'的 toast 提示？对话框是否已关闭？"
+
+  # ============================================================
+  # 3.6 重命名训练任务
+  # ============================================================
+  - id: "3.6.1"
+    name: "切换到 3DGS Tab 找到刚创建的任务"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "3DGS"
+      role: tab
+
+  - id: "3.6.2"
+    name: "等待列表加载"
+    action: wait
+    params:
+      ms: 2000
+
+  - id: "3.6.3"
+    name: "点击任务卡片的更多按钮"
+    action: find_and_click
+    params:
+      strategy: card_menu_button
+      name_contains: "auto-3dgs"
+
+  - id: "3.6.4"
+    name: "验证 Popover 菜单弹出"
+    action: wait
+    params:
+      ms: 500
+    verify:
+      - type: text_visible
+        text: "重命名"
+
+  - id: "3.6.5"
+    name: "点击重命名"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "重命名"
+      role: menuitem
+
+  - id: "3.6.6"
+    name: "验证重命名对话框"
+    action: wait
+    params:
+      ms: 500
+    verify:
+      - type: text_visible
+        text: "重命名任务"
+      - type: element_exists
+        role: textbox
+
+  - id: "3.6.7"
+    name: "修改任务名称"
+    action: find_and_fill
+    params:
+      strategy: by_role
+      role: textbox
+      text: "renamed-3dgs-{timestamp}"
+
+  - id: "3.6.8"
+    name: "点击确认"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "确认"
+      role: button
+
+  - id: "3.6.9"
+    name: "验证重命名成功"
+    action: wait
+    params:
+      ms: 1000
+    verify:
+      - type: ai_judge
+        question: "是否显示了'重命名成功'的 toast 提示？对话框是否已关闭？"
+
+  # ============================================================
+  # 3.7 删除训练任务（删除刚创建的测试任务，避免数据污染）
+  # ============================================================
+  - id: "3.7.1"
+    name: "点击任务卡片的更多按钮"
+    action: find_and_click
+    params:
+      strategy: card_menu_button
+      name_contains: "renamed-3dgs"
+
+  - id: "3.7.2"
+    name: "点击删除"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "删除"
+      role: menuitem
+
+  - id: "3.7.3"
+    name: "验证删除确认对话框"
+    action: wait
+    params:
+      ms: 500
+    verify:
+      - type: text_visible
+        text: "删除"
+      - type: ai_judge
+        question: "是否弹出了删除确认对话框？是否有'取消'和'删除'按钮？"
+
+  - id: "3.7.4"
+    name: "确认删除"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "删除"
+      role: button
+
+  - id: "3.7.5"
+    name: "验证删除成功"
+    action: wait
+    params:
+      ms: 1500
+    verify:
+      - type: ai_judge
+        question: "是否显示了'删除成功'的 toast 提示？对话框是否已关闭？"
+
+  # 同样删除 Mesh 测试任务
+  - id: "3.7.6"
+    name: "切换到 Mesh Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "Mesh"
+      role: tab
+
+  - id: "3.7.7"
+    name: "等待 Mesh 列表加载"
+    action: wait
+    params:
+      ms: 2000
+
+  - id: "3.7.8"
+    name: "点击 Mesh 任务更多按钮"
+    action: find_and_click
+    params:
+      strategy: card_menu_button
+      name_contains: "auto-mesh"
+
+  - id: "3.7.9"
+    name: "点击删除"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "删除"
+      role: menuitem
+
+  - id: "3.7.10"
+    name: "确认删除 Mesh 任务"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "删除"
+      role: button
+
+  - id: "3.7.11"
+    name: "验证 Mesh 任务删除成功"
+    action: wait
+    params:
+      ms: 1500
+    verify:
+      - type: ai_judge
+        question: "是否显示了'删除成功'的 toast 提示？"
+
+  # ============================================================
+  # 3.10 搜索和过滤
+  # ============================================================
+  - id: "3.10.1"
+    name: "切换到点云 Tab"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "点云"
+      role: tab
+
+  - id: "3.10.2"
+    name: "等待列表加载"
+    action: wait
+    params:
+      ms: 2000
+
+  - id: "3.10.3"
+    name: "在搜索框输入关键词"
+    action: find_and_fill
+    params:
+      strategy: by_role
+      role: searchbox
+      fallback_role: textbox
+      fallback_name_contains: "搜索"
+      text: "nonexistent_query_xyz"
+
+  - id: "3.10.4"
+    name: "等待搜索防抖"
+    action: wait
+    params:
+      ms: 1500
+
+  - id: "3.10.5"
+    name: "验证搜索无结果提示"
+    action: snapshot
+    verify:
+      - type: ai_judge
+        question: "页面是否显示了'未找到训练任务'或类似的空状态提示？"
+
+  - id: "3.10.6"
+    name: "清空搜索框恢复列表"
+    action: find_and_fill
+    params:
+      strategy: by_role
+      role: searchbox
+      fallback_role: textbox
+      fallback_name_contains: "搜索"
+      text: ""
+
+  - id: "3.10.7"
+    name: "等待列表恢复"
+    action: wait
+    params:
+      ms: 1500
+
+  # ============================================================
+  # 返回项目列表
+  # ============================================================
+  - id: "3.end"
+    name: "点击返回按钮回到项目列表"
+    action: find_and_click
+    params:
+      strategy: by_text
+      text: "返回"
+      role: button
+
+  - id: "3.end.verify"
+    name: "验证回到项目列表"
+    action: wait
+    params:
+      ms: 2000
+    verify:
+      - type: url_contains
+        value: "/datasets/list"

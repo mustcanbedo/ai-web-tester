@@ -856,6 +856,15 @@
                 if (currentLoginType === 'password') {
                     config.username = document.getElementById('loginUsername').value.trim();
                     config.password = document.getElementById('loginPassword').value;
+                    // 自动生成 initial_actions：导航到登录页 → 等待加载
+                    // 登录填写仍交给 LLM（因为不同站点表单结构不同）
+                    const loginUrl = config.login_url;
+                    if (loginUrl && loginUrl !== targetUrl) {
+                        config.initial_actions = [
+                            { type: 'navigate', params: { url: loginUrl } },
+                            { type: 'wait', params: { ms: 1500 } },
+                        ];
+                    }
                 } else {
                     config.phone = document.getElementById('loginPhone').value.trim();
                 }
