@@ -14,6 +14,7 @@ from config import (
     LLM_RATE_LIMIT_BASE_WAIT,
     HISTORY_COMPRESS_THRESHOLD, HISTORY_COMPRESS_THRESHOLD_L2,
     HISTORY_KEEP_RECENT, HISTORY_KEEP_RECENT_L2, HISTORY_MAX_SUMMARY_LINES,
+    TOKEN_BUDGET_WARN, TOKEN_BUDGET_CRITICAL,
 )
 from logger import get_logger
 
@@ -273,7 +274,14 @@ class LLMEngine:
         refs_str = json.dumps(truncated_refs, ensure_ascii=False) if truncated_refs else "[]"
         if refs_hint:
             refs_str += f"\n{refs_hint}"
-        page_text = page_state.get("text", "")[:1500]
+        # Token 预算管理：根据已消耗 token 数动态调整 page_text 长度
+        total_tokens_used = self.total_input_tokens + self.total_output_tokens
+        if total_tokens_used >= TOKEN_BUDGET_CRITICAL:
+            page_text = ""  # 超预算：完全不注入 page_text，只保留 refs
+        elif total_tokens_used >= TOKEN_BUDGET_WARN:
+            page_text = page_state.get("text", "")[:500]  # 节约模式
+        else:
+            page_text = page_state.get("text", "")[:1500]
         obs = f"## 第 {step} 步观察\n\n**页面URL**: {page_state.get('url','')}\n**页面标题**: {page_state.get('title','')}\n"
         # 多标签页信息
         tab_info = page_state.get("tabs")
@@ -412,21 +420,48 @@ class LLMEngine:
                     return {"thinking": f"LLM API 限流，等待后重试", "action": {"type": "wait", "params": {"ms": 5000}}, "found_issues": [], "current_flow": "", "flow_status": "testing", "checklist_item": "API限流等待", "should_continue": True}
                 return {"thinking": f"LLM 调用失败: {error_str}", "action": {"type": "fatal_error", "params": {"summary": f"LLM 错误: {error_str}"}}, "found_issues": [], "current_flow": "", "flow_status": "failed", "checklist_item": "LLM 调用失败", "should_continue": False}
 
+    def _compress_action_history(self, action_history):
+        """将 action_history 压缩为简洁的文本格式，确保所有步骤都可见"""
+        lines = []
+        for a in action_history:
+            step = a.get("step", "?")
+            flow = a.get("flow", "")
+            action = a.get("action", {})
+            atype = action.get("type", "unknown")
+            result = a.get("result", {})
+            success = "✓" if result.get("success") else "✗"
+            msg = result.get("message", "")[:80]
+            ci = a.get("checklist_item", "")
+            fs = a.get("flow_status", "")
+            # 紧凑单行格式
+            line = f"[{step}] {flow} | {atype} {success} | {ci}"
+            if not result.get("success"):
+                line += f" | 失败: {msg}"
+            if fs in ("passed", "failed"):
+                line += f" | flow_status={fs}"
+            lines.append(line)
+        return "\n".join(lines)
+
     def generate_report(self, action_history, all_issues, evidence_summary, spec_content, login_type="", data_checks=None):
         tested_flows = set()
+        flow_step_counts = {}
         for entry in action_history:
             flow = entry.get("flow", "")
             if flow:
                 tested_flows.add(flow)
-        tested_flows_str = "、".join(tested_flows) if tested_flows else "无"
+                flow_step_counts[flow] = flow_step_counts.get(flow, 0) + 1
+        tested_flows_str = "、".join(f"{f}({flow_step_counts.get(f,0)}步)" for f in tested_flows) if tested_flows else "无"
+
+        # 压缩 action history 确保所有步骤可见
+        compressed_history = self._compress_action_history(action_history)
 
         prompt = f"""请根据以下测试执行记录生成专业的 Markdown 格式测试报告。
 
 ## 功能预期文档
 {spec_content}
 
-## 执行历史 ({len(action_history)} 步)
-{json.dumps(action_history, ensure_ascii=False)[:6000]}
+## 执行历史 (共 {len(action_history)} 步，每一步都必须在报告中体现)
+{compressed_history}
 
 ## 实际测试过的流程
 {tested_flows_str}
@@ -449,25 +484,29 @@ class LLMEngine:
 ## 数据验证记录
 {json.dumps(data_checks, ensure_ascii=False) if data_checks else '无数据验证'}
 
-## 报告要求（严格遵守）
-1. **只报告实际执行过的流程**：只有在"执行历史"中有对应操作步骤的流程才能判定为"通过"或"未通过"
-2. **未执行的流程必须标记为"⏭️ 未测试"**：功能预期文档中有但执行历史中没有涉及的流程，一律标记为"未测试"，不要猜测结果
+## 报告要求（严格遵守，违反任何一条都是不合格的报告）
+1. **你必须阅读上面执行历史的每一行**：从第 1 步到第 {len(action_history)} 步，不能遗漏任何步骤。特别注意后半段的步骤。
+2. **流程判定规则**：
+   - ✅通过：该流程的核心步骤都有对应的执行记录且操作成功（✓）
+   - ❌未通过：该流程有执行记录但核心步骤失败或验证不通过
+   - ⏭️未测试：执行历史中完全没有该流程的步骤
 3. **不要编造测试结果**：只基于执行历史中的实际操作和结果来判定
+4. **注意 checklist_item**：它标明了每一步对应的子任务编号（如 4.2），用于判断流程是否完成
 
 请生成包含以下部分的报告：
 1. 测试概要（总共执行了多少步，覆盖了哪些流程，有多少流程未测试）
-2. 测试结论（每个流程的状态：✅通过 / ❌未通过 / ⏭️未测试）
+2. 测试结论（每个流程的状态：✅通过 / ❌未通过 / ⏭️未测试，必须逐个判定）
 3. Bug 列表（含严重等级、描述、证据）
 4. 数据一致性验证结果（如有）
 5. 异常信息（Console/Network 错误）
-6. 执行时间线（仅列出实际执行的步骤）
+6. 执行时间线（列出所有 {len(action_history)} 个实际步骤）
 
 直接输出 Markdown 内容，不要代码块标记。"""
         try:
             response = self.client.chat.completions.create(model=self.model, messages=[
-                {"role": "system", "content": "你是一个专业的测试报告撰写者。请生成清晰、专业的 Markdown 格式测试报告。"},
+                {"role": "system", "content": "你是一个专业的测试报告撰写者。请生成清晰、专业的 Markdown 格式测试报告。注意：你必须完整阅读执行历史的每一步，不能跳过任何步骤。"},
                 {"role": "user", "content": prompt},
-            ], temperature=0.3, max_tokens=3000)
+            ], temperature=0.3, max_tokens=4000)
             if response.usage:
                 self.total_input_tokens += response.usage.prompt_tokens
                 self.total_output_tokens += response.usage.completion_tokens

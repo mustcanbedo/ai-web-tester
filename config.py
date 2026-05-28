@@ -51,5 +51,9 @@ LLM_RATE_LIMIT_BASE_WAIT = 15       # 限流时基础等待秒数（实际 = bas
 # ---------- 批量执行 ----------
 MAX_ACTIONS_PER_STEP = 4            # 每步最多批量执行的 action 数
 
+# ---------- Token 预算管理 ----------
+TOKEN_BUDGET_WARN = 1_000_000       # 总 token 超过此值进入节约模式（缩短 page_text）
+TOKEN_BUDGET_CRITICAL = 2_000_000   # 超过此值强制精简（只保留 refs，不注入 page_text）
+
 # ---------- 日志 ----------
 LOG_LEVEL = "DEBUG"                  # DEBUG / INFO / WARNING / ERROR

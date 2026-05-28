@@ -24,6 +24,9 @@ from evidence import EvidenceCollector
 from llm_engine import LLMEngine
 from action_executor import ActionExecutor
 from eval_engine import evaluate_test_run, format_eval_report
+from reviewer_agent import ReviewerAgent
+from test_memory import TestMemory
+from planner_agent import PlannerAgent
 
 logger = get_logger("test_runner")
 
@@ -38,6 +41,46 @@ def extract_page_state(bridge: PlaywrightBridge) -> dict:
         return bridge.get_page_state()
     except Exception as e:
         return {"url": "", "title": "ERROR", "refs": [], "text": str(e)}
+
+
+def _refs_hash(state: dict) -> str:
+    """计算 AX Tree refs 的签名，用于稳定性比较"""
+    return hashlib.md5(
+        json.dumps([(r.get('role', ''), r.get('name', ''))
+                     for r in state.get('refs', [])], sort_keys=True).encode()
+    ).hexdigest()[:12]
+
+
+def _wait_for_page_stable(bridge: PlaywrightBridge,
+                          max_wait: float = 3.0, interval: float = 0.5,
+                          last_action_type: str = "") -> dict:
+    """
+    智能等待页面 DOM 稳定后再抓取状态。
+    策略：每隔 interval 秒抓一次 AX Tree，连续两次 hash 相同则视为稳定。
+    最少等待 interval 秒（保证至少 1 次渲染周期），最多等待 max_wait 秒。
+    last_action_type: 上一步的操作类型，navigate/click 给予更长等待。
+    """
+    # 自适应等待：导航型操作给更多时间让 SPA/MPA 完成加载
+    if last_action_type in ("navigate", "click", "switch_tab"):
+        max_wait = max(max_wait, 5.0)
+        interval = 0.8  # 更长间隔避免在加载中途拿到中间状态
+
+    time.sleep(interval)  # 至少等待一个渲染周期
+    prev_state = extract_page_state(bridge)
+    prev_hash = _refs_hash(prev_state)
+    waited = interval
+
+    while waited < max_wait:
+        time.sleep(interval)
+        waited += interval
+        curr_state = extract_page_state(bridge)
+        curr_hash = _refs_hash(curr_state)
+        if curr_hash == prev_hash:
+            return curr_state  # DOM 已稳定
+        prev_state = curr_state
+        prev_hash = curr_hash
+
+    return prev_state  # 超时，返回最新状态
 
 
 # ============================================================
@@ -153,6 +196,7 @@ def _test_loop(
     augmented_spec, login_info, api_doc,
     current_flow_name, completed_flows,
     config, min_steps=None,
+    reviewer=None, memory=None, plan=None,
 ):
     """
     公共测试主循环，由 run_test_task 和 resume_test_task 共用。
@@ -203,9 +247,9 @@ def _test_loop(
         # 采集证据
         evidence.collect()
 
-        # 观察
-        time.sleep(1)  # 等待页面渲染稳定
-        page_state = extract_page_state(bridge)
+        # 观察：智能等待页面 DOM 稳定（连续两次 AX Tree 一致则视为稳定）
+        prev_action_type = action_history[-1].get("action", {}).get("type", "") if action_history else ""
+        page_state = _wait_for_page_stable(bridge, last_action_type=prev_action_type)
         emit("log", {"message": f"页面状态: url={page_state.get('url','')}, refs={len(page_state.get('refs',[]))}个, text={len(page_state.get('text',''))}字符"})
 
         # State Hash：记录页面状态签名，用于检测「操作无效果」
@@ -250,6 +294,12 @@ def _test_loop(
             if not last_result.get("success"):
                 extra_context += f"\n上一步操作失败: {last_result.get('message', '')}"
 
+        # 注入结构化记忆上下文（独立于 LLM 消息历史，不随裁剪丢失）
+        if memory:
+            memory_ctx = memory.get_context_for_step(current_flow_name)
+            if memory_ctx:
+                extra_context += f"\n{memory_ctx}"
+
         # 思考
         emit("thinking", {"step": step, "message": "LLM 正在分析页面状态并决策..."})
         # 从 action_history 提取当前流程已完成的子节（去重）
@@ -268,6 +318,16 @@ def _test_loop(
             "current_flow": current_flow_name,
             "done_items_in_current_flow": done_items_in_flow[-20:],  # 最近 20 个
         }
+        # 注入 Planner 结构化计划上下文（当前流程的步骤进度 + 下一步验证条件）
+        if plan and plan.get("flows"):
+            plan_ctx = PlannerAgent.get_current_step_context(plan, current_flow_name, done_items_in_flow)
+            if plan_ctx:
+                extra_context += f"\n{plan_ctx}"
+            # 如果 Agent 还没有 flow，提示从计划的第一个未完成流程开始
+            if not current_flow_name:
+                next_flow = PlannerAgent.get_next_flow(plan, completed_flows, failed_flows)
+                if next_flow:
+                    extra_context += f"\n请从流程「{next_flow}」开始测试。"
         decision = llm.decide(page_state, new_evidence, step, extra_context, recent_api if recent_api else None, flow_progress=flow_progress)
         extra_context = ""
         emit("token_update", {"input": llm.total_input_tokens, "output": llm.total_output_tokens})
@@ -294,6 +354,34 @@ def _test_loop(
         should_continue = decision.get("should_continue", True)
         next_plan = decision.get("next_plan", "")
         checklist_item = decision.get("checklist_item", "")
+
+        # Planner 约束：Agent 返回的 flow 名称必须在计划中，否则纠正
+        if plan and plan.get("flows") and flow:
+            allowed = PlannerAgent.get_allowed_flow_names(plan)
+            if flow not in allowed:
+                # 尝试模糊匹配（Agent 可能省略了编号或用了略不同的名称）
+                matched = [a for a in allowed if flow in a or a in flow]
+                if matched:
+                    logger.debug(f"Planner 纠正流程名: '{flow}' → '{matched[0]}'")
+                    flow = matched[0]
+                else:
+                    logger.info(f"Planner 拒绝 spec 外流程: '{flow}', 保持 '{current_flow_name}'")
+                    flow = current_flow_name or (allowed[0] if allowed else flow)
+
+            # 流程前置条件检查：切换到新流程时，检查前置条件是否有依赖失败的流程
+            if flow != current_flow_name and flow:
+                target_flow_def = next((f for f in plan["flows"] if f.get("name") == flow or f.get("id") == flow), None)
+                if target_flow_def and target_flow_def.get("preconditions"):
+                    failed_flow_names = [f.get("flow", "") for f in failed_flows]
+                    # 检查前置条件是否提到了失败的流程关键词
+                    precond_text = " ".join(target_flow_def["preconditions"])
+                    blocked_by = [fn for fn in failed_flow_names if any(kw in precond_text for kw in fn.split("：")[-1:])]
+                    if blocked_by:
+                        extra_context += (
+                            f"\n⚠️ 流程「{flow}」的前置条件可能未满足（依赖的流程已失败：{', '.join(blocked_by)}）。"
+                            f"\n前置条件：{precond_text}"
+                            f"\n如果无法满足前置条件，请直接标记此流程为 failed 并跳到下一个流程。"
+                        )
 
         # ---- 子流程卡死检测（基于操作模式） ----
         # 不依赖 checklist_item 文本匹配（Agent 每步描述都不同），
@@ -359,17 +447,57 @@ def _test_loop(
         # 流程切换检测：当 flow 名称变化时重置 LLM 上下文
         if flow and current_flow_name and flow != current_flow_name:
             # 统计当前流程实际执行了多少步
-            flow_step_count = sum(1 for a in action_history if a.get("flow") == current_flow_name)
-            if flow_status == "failed" or any(i.get("flow") == current_flow_name for i in all_issues):
+            flow_steps_list = [a for a in action_history if a.get("flow") == current_flow_name]
+            flow_step_count = len(flow_steps_list)
+            flow_issues = [i for i in all_issues if i.get("flow") == current_flow_name]
+            if flow_status == "failed" or flow_issues:
                 if not any(f["flow"] == current_flow_name for f in failed_flows):
-                    reason = next((i.get("title", "") for i in all_issues if i.get("flow") == current_flow_name), "未知原因")
+                    reason = next((i.get("title", "") for i in flow_issues), "未知原因")
                     failed_flows.append({"flow": current_flow_name, "reason": reason})
+                if memory:
+                    memory.on_flow_complete(current_flow_name, flow_steps_list, "failed", flow_issues)
             elif current_flow_name not in completed_flows:
-                # LLM 标记流程为 passed 且至少执行了 1 步就标记为 completed
-                if flow_step_count >= 1:
-                    completed_flows.append(current_flow_name)
-                    if flow_step_count < 3:
-                        logger.info(f"[Step {step}] 流程 '{current_flow_name}' 仅执行了 {flow_step_count} 步，标记 completed（可能测试不够深入）")
+                # Planner 门控：检查是否有必要步骤被跳过
+                skipped_required = []
+                if plan and plan.get("flows"):
+                    remaining = PlannerAgent.count_remaining_steps(plan, current_flow_name, done_items_in_flow)
+                    if remaining > 0:
+                        pending = PlannerAgent.get_current_pending_step(plan, current_flow_name, done_items_in_flow)
+                        if pending and pending.get("priority") == "required":
+                            skipped_required.append(pending.get("description", pending.get("id", "")))
+                if skipped_required:
+                    # 阻止流程完成，把 Agent 拉回未完成的步骤
+                    logger.warning(f"[Step {step}] 流程 '{current_flow_name}' 有未完成的必要步骤: {skipped_required}")
+                    emit("log", {"message": f"⚠️ 流程「{current_flow_name}」有必要步骤未完成: {', '.join(skipped_required)}，阻止切换"})
+                    extra_context += (
+                        f"\n🚫 系统阻止了流程切换：「{current_flow_name}」还有 {len(skipped_required)} 个必要步骤未完成。"
+                        f"\n请先完成: {', '.join(skipped_required)}。完成后再切换到下一个流程。"
+                    )
+                    flow = current_flow_name  # 强制保持在当前流程
+                else:
+                    # LLM 标记流程为 passed 且至少执行了 1 步就标记为 completed
+                    if flow_step_count >= 1:
+                        completed_flows.append(current_flow_name)
+                        if flow_step_count < 3:
+                            logger.info(f"[Step {step}] 流程 '{current_flow_name}' 仅执行了 {flow_step_count} 步，标记 completed（可能测试不够深入）")
+                    if memory:
+                        memory.on_flow_complete(current_flow_name, flow_steps_list, "passed", flow_issues)
+            # Reviewer 流程级审查（可选：检查覆盖完整性）
+            if reviewer and flow_step_count >= 3:
+                flow_review = reviewer.review_flow_completion(current_flow_name, flow_steps_list)
+                if not flow_review["sufficiently_tested"] and flow_review.get("missed_items"):
+                    missed = ", ".join(flow_review["missed_items"][:3])
+                    emit("log", {"message": f"📋 Reviewer 提示: {current_flow_name} 可能遗漏: {missed}"})
+                # 清除 Reviewer 识别的疑似误报
+                if flow_review.get("false_positive_suspects"):
+                    for suspect in flow_review["false_positive_suspects"]:
+                        removed = [i for i in all_issues if suspect in i.get("title", "")]
+                        if removed:
+                            all_issues[:] = [i for i in all_issues if suspect not in i.get("title", "")]
+                            emit("log", {"message": f"🔍 Reviewer 移除疑似误报: {suspect}"})
+                            if memory:
+                                for r in removed:
+                                    memory.on_bug_rejected(r, f"流程审查时识别为误报")
             logger.debug(f"[Step {step}] 流程切换: '{current_flow_name}' → '{flow}'")
             emit("log", {"message": f"🔄 流程切换: {current_flow_name} → {flow}（上下文已重置）"})
             current_page_url = page_state.get("url", "")
@@ -390,14 +518,34 @@ def _test_loop(
 
         if issues:
             existing_titles = {i.get("title", "") for i in all_issues}
+            rejected_titles = memory.get_rejected_bug_titles() if memory else set()
             for issue in issues:
                 title = issue.get("title", "")
-                if title not in existing_titles:
-                    issue["flow"] = current_flow_name
-                    issue["step"] = step
-                    all_issues.append(issue)
-                    existing_titles.add(title)
-                    emit("bug", {"severity": issue.get("severity"), "title": title, "description": issue.get("description")})
+                if title in existing_titles:
+                    continue
+                # 快速过滤：已被 Reviewer 否决过的同标题 Bug 不再重复审查
+                if title in rejected_titles:
+                    logger.debug(f"[Step {step}] Bug 已被否决过，跳过: {title}")
+                    continue
+                # Reviewer 独立审查
+                if reviewer:
+                    action_ctx = f"最近操作: {action.get('type', '')} | thinking: {thinking[:200]}"
+                    review = reviewer.review_bug(issue, page_state, new_evidence, action_ctx)
+                    if not review["is_valid"]:
+                        emit("log", {"message": f"🔍 Reviewer 否决误报: {title} | {review['reason']}"})
+                        if memory:
+                            memory.on_bug_rejected(issue, review["reason"])
+                        continue
+                    # Reviewer 可能降低严重等级
+                    if review.get("revised_severity") and review["revised_severity"] != issue.get("severity"):
+                        issue["severity"] = review["revised_severity"]
+                issue["flow"] = current_flow_name
+                issue["step"] = step
+                all_issues.append(issue)
+                existing_titles.add(title)
+                emit("bug", {"severity": issue.get("severity"), "title": title, "description": issue.get("description")})
+                if memory:
+                    memory.on_bug_confirmed(issue)
 
         # 处理人工输入请求
         if action.get("type") == "request_human_input":
@@ -442,9 +590,13 @@ def _test_loop(
             if step < effective_min_steps:
                 reject_reason = f"步数不足（{step}/{effective_min_steps}，基于文档结构动态计算）"
             else:
-                # 检查 1：从文档中提取所有流程名，对比是否有完全未触及的流程
-                from eval_engine import _extract_flows_from_spec
-                spec_flows = _extract_flows_from_spec(augmented_spec)
+                # 检查 1：判断是否有完全未触及的流程
+                if plan and plan.get("flows"):
+                    # 优先用 Planner 计划的流程名（精确匹配）
+                    spec_flows = PlannerAgent.get_allowed_flow_names(plan)
+                else:
+                    from eval_engine import _extract_flows_from_spec
+                    spec_flows = _extract_flows_from_spec(augmented_spec)
                 # 排除 [SKIP] 标记的流程
                 spec_flows = [f for f in spec_flows if '[SKIP]' not in f and '[skip]' not in f]
                 touched_flows = set(completed_flows) | set(f.get("flow", "") for f in failed_flows) | set(a.get("flow", "") for a in action_history if a.get("flow"))
@@ -548,6 +700,13 @@ def _test_loop(
         # 实时推送当前页面截图到前端直播面板
         emit("live_screenshot", {"step": step, "base64": ss["base64"], "action": action.get("type", ""), "label": checklist_item or result["message"]})
 
+        # 检查是否有 alert/confirm/prompt 弹窗被自动处理
+        pending_dialogs = bridge.get_pending_dialogs()
+        if pending_dialogs:
+            dialog_info = "; ".join(f"[{d['type']}] {d['message']}" for d in pending_dialogs)
+            extra_context += f"\n💬 系统检测到浏览器弹窗已自动接受: {dialog_info}"
+            emit("log", {"message": f"💬 Dialog 捕获: {dialog_info}"})
+
         # 操作成功时重置连续 finish 拒绝计数器
         if result["success"]:
             consecutive_finish_rejects = 0
@@ -576,6 +735,27 @@ def _test_loop(
             "checklist_item": checklist_item,
             "batch_size": len(batch_results),
         })
+
+        # ---- Planner 步骤节奏控制 ----
+        # 如果 Agent 在同一个 Planner 子步骤上花费过多步数，强制推进
+        if plan and plan.get("flows") and current_flow_name and result["success"]:
+            pending_step = PlannerAgent.get_current_pending_step(plan, current_flow_name, done_items_in_flow)
+            if pending_step:
+                # 统计当前子步骤花费的步数（最近 N 步中同一 flow 且 checklist_item 未变）
+                same_step_count = 0
+                for a in reversed(action_history[-8:]):
+                    if a.get("flow") == current_flow_name:
+                        same_step_count += 1
+                    else:
+                        break
+                # 超过 5 步还在同一子步骤 → 提示验证并推进
+                if same_step_count >= 5:
+                    extra_context += (
+                        f"\n\n⏩ **你已在子步骤「{pending_step.get('description', '')}」上花费了 {same_step_count} 步。**\n"
+                        f"验证条件是：{pending_step.get('verify', '')}\n"
+                        f"如果验证条件已满足，请立即在 checklist_item 中记录当前步骤描述并推进到下一个子步骤。\n"
+                        f"如果无法满足验证条件，记录 Bug 后跳过此步骤，继续下一个子步骤。"
+                    )
 
         # ---- 智能终止检测 ----
         action_key = json.dumps(action, sort_keys=True, ensure_ascii=False)
@@ -668,6 +848,10 @@ def _test_loop(
     task["_completed_flows"] = completed_flows
     task["_failed_flows"] = failed_flows
     task["_min_steps"] = min_steps or 0
+    if reviewer:
+        task["_reviewer_stats"] = reviewer.get_stats()
+    if memory:
+        task["_memory_stats"] = memory.get_stats()
 
     return step, action_history, all_issues, executor.data_checks
 
@@ -718,6 +902,11 @@ def _finalize_test(task_id, task, llm, bridge, executor, evidence,
     need_login = config.get("need_login", False)
     login_type = config.get("login_type", "")
 
+    # 输出 Reviewer 统计
+    reviewer_stats = task.get("_reviewer_stats", {})
+    if reviewer_stats and reviewer_stats.get("review_count", 0) > 0:
+        emit("log", {"message": f"🔍 Reviewer 统计: 审查 {reviewer_stats['review_count']} 个 Bug, 否决 {reviewer_stats['rejected_count']} 个 (否决率 {reviewer_stats['rejection_rate']})"})
+
     emit("status", {"status": "generating_report", "message": "正在生成测试报告..."})
     report = llm.generate_report(action_history, all_issues, evidence.get_summary(), spec_content, login_type if need_login else "", data_checks if data_checks else None)
 
@@ -754,6 +943,8 @@ def _finalize_test(task_id, task, llm, bridge, executor, evidence,
         "evidence_summary": evidence.get_summary(), "data_checks": data_checks,
         "token_usage": {"input_tokens": llm.total_input_tokens, "output_tokens": llm.total_output_tokens},
         "eval_metrics": eval_metrics,
+        "reviewer_stats": task.get("_reviewer_stats", {}),
+        "memory_stats": task.get("_memory_stats", {}),
     }
     log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -762,7 +953,14 @@ def _finalize_test(task_id, task, llm, bridge, executor, evidence,
     task["report_file"] = report_filename
     task["total_steps"] = step
     task["issues_count"] = len(all_issues)
-    task["token_usage"] = {"input": llm.total_input_tokens, "output": llm.total_output_tokens}
+    reviewer_stats = task.get("_reviewer_stats", {})
+    reviewer_tokens = reviewer_stats.get("total_tokens", 0)
+    planner_tokens = task.get("_planner_tokens", 0)
+    task["token_usage"] = {
+        "input": llm.total_input_tokens, "output": llm.total_output_tokens,
+        "reviewer_tokens": reviewer_tokens,
+        "planner_tokens": planner_tokens,
+    }
     task["video_file"] = video_filename
 
     emit("complete", {
@@ -803,6 +1001,8 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
         llm_base_url = config.get("llm_base_url", "").strip() or None
         llm_model = config.get("llm_model", "").strip() or None
         llm = LLMEngine(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+        reviewer = ReviewerAgent(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+        memory = TestMemory()
         evidence = EvidenceCollector()
         action_history = []
         all_issues = []
@@ -888,7 +1088,22 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
                 )
 
             dynamic_min_steps = estimate_min_steps(spec_content)
-            emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
+
+            # Planner：将 spec 转为结构化测试计划
+            planner = PlannerAgent(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+            test_plan = planner.plan(spec_content)
+            task["_planner_tokens"] = planner.total_tokens
+            if test_plan.get("flows"):
+                plan_flows = [f.get("name", f.get("id", "")) for f in test_plan["flows"]]
+                # Planner 提供的步骤数更精准，用它来覆盖文档估算（×1.5 留余量）
+                plan_min = int(test_plan.get("total_steps", 0) * 1.5)
+                if plan_min > 0:
+                    dynamic_min_steps = max(plan_min, 15)
+                emit("log", {"message": f"📋 Planner 生成计划: {len(test_plan['flows'])} 个流程 ({', '.join(plan_flows)}), {test_plan.get('total_steps', 0)} 个步骤, 最小步数={dynamic_min_steps}"})
+            else:
+                emit("log", {"message": "⚠️ Planner 未生成有效计划，将使用自由探索模式"})
+                test_plan = None
+                emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
 
             start_step = len(initial_actions) if initial_actions else 0
             step, action_history, all_issues, data_checks = _test_loop(
@@ -899,6 +1114,7 @@ def run_test_task(task_id: str, config: dict, tasks: dict):
                 augmented_spec=augmented_spec, login_info=login_info, api_doc=api_doc,
                 current_flow_name="", completed_flows=[],
                 config=config, min_steps=dynamic_min_steps,
+                reviewer=reviewer, memory=memory, plan=test_plan,
             )
         finally:
             if 'executor' in dir() or 'executor' in locals():
@@ -1007,6 +1223,8 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
         llm_model = config.get("llm_model", "").strip() or None
         llm = LLMEngine(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
         llm.init_conversation(augmented_spec, login_info, api_doc)
+        reviewer = ReviewerAgent(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+        memory = TestMemory()
 
         evidence = EvidenceCollector()
         bridge = PlaywrightBridge(headless=True, video_dir=str(VIDEO_DIR))
@@ -1075,7 +1293,19 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
                 current_flow_name = completed_flows[-1]
 
             dynamic_min_steps = estimate_min_steps(spec_content)
-            emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
+
+            # Planner：将 spec 转为结构化测试计划
+            planner = PlannerAgent(api_key=llm_api_key, base_url=llm_base_url, model=llm_model)
+            test_plan = planner.plan(spec_content)
+            task["_planner_tokens"] = planner.total_tokens
+            if test_plan.get("flows"):
+                plan_min = int(test_plan.get("total_steps", 0) * 1.5)
+                if plan_min > 0:
+                    dynamic_min_steps = max(plan_min, 15)
+                emit("log", {"message": f"📋 Planner 生成计划: {len(test_plan['flows'])} 个流程, {test_plan.get('total_steps', 0)} 个步骤, 最小步数={dynamic_min_steps}"})
+            else:
+                test_plan = None
+                emit("log", {"message": f"📊 文档动态分析：最小测试步数 = {dynamic_min_steps}"})
 
             step, action_history, all_issues, data_checks = _test_loop(
                 task_id=task_id, task=task, llm=llm, bridge=bridge,
@@ -1085,6 +1315,7 @@ def resume_test_task(task_id: str, snapshot: dict, rollback_steps: int, tasks: d
                 augmented_spec=augmented_spec, login_info=login_info, api_doc=api_doc,
                 current_flow_name=current_flow_name, completed_flows=completed_flows,
                 config=config, min_steps=dynamic_min_steps,
+                reviewer=reviewer, memory=memory, plan=test_plan,
             )
         finally:
             _finalize_test(task_id, task, llm, bridge, executor, evidence,

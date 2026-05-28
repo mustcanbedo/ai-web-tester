@@ -34,6 +34,8 @@ class PlaywrightBridge:
         # ref -> CDP backendDOMNodeId 映射（每次 snapshot 刷新）
         self._ref_map: dict = {}
         self._ref_counter = 0
+        # dialog/alert 事件队列
+        self._pending_dialogs: list = []
 
     # ------------------------------------------------------------------
     # 生命周期管理
@@ -58,11 +60,34 @@ class PlaywrightBridge:
         self._cdp = self._context.new_cdp_session(self._page)
         # 监听 window.open 打开的新页面
         self._context.on("page", self._on_new_page)
+        # 监听 alert/confirm/prompt 弹窗
+        self._register_dialog_handler(self._page)
         return True
+
+    def _register_dialog_handler(self, page: Page):
+        """为页面注册 dialog 监听，自动接受并记录 alert/confirm/prompt"""
+        def _on_dialog(dialog):
+            info = {
+                "type": dialog.type,           # "alert" | "confirm" | "prompt" | "beforeunload"
+                "message": dialog.message,
+            }
+            if dialog.type == "prompt":
+                info["default_value"] = dialog.default_value
+            self._pending_dialogs.append(info)
+            logger.debug(f"Dialog 捕获: [{dialog.type}] {dialog.message[:100]}")
+            dialog.accept()
+        page.on("dialog", _on_dialog)
+
+    def get_pending_dialogs(self):
+        """获取并清空自上次调用以来的所有 dialog 事件"""
+        dialogs = self._pending_dialogs[:]
+        self._pending_dialogs.clear()
+        return dialogs
 
     def _on_new_page(self, page: Page):
         """window.open 打开新页面时自动捕获"""
         page.wait_for_load_state("domcontentloaded")
+        self._register_dialog_handler(page)
         self._pages.append(page)
         new_idx = len(self._pages) - 1
         logger.debug(f"检测到新标签页: index={new_idx} url={page.url}")

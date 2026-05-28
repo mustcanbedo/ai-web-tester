@@ -144,24 +144,25 @@ def evaluate_test_run(
 
 
 def _extract_flows_from_spec(spec_content: str) -> list:
-    """从功能预期文档中提取流程名称列表"""
+    """从功能预期文档中提取流程名称列表（流程级别，非子步骤级别）"""
     flows = []
-    # 匹配 "## 流程N：xxx" 或 "## 流程 N: xxx" 或 "## N. xxx"
+    # 匹配 "## 流程N：xxx" 或 "## 流程 N: xxx"（支持中文数字和阿拉伯数字）
     patterns = [
-        r"##\s*流程\s*\d+[：:]\s*(.+)",
-        r"##\s*\d+\.\s*(.+)",
-        r"##\s*(?:Flow|Test)\s*\d+[：:]\s*(.+)",
+        r"^##\s*流程\s*[\d一二三四五六七八九十]+[：:]\s*(.+)",
+        r"^##\s*(?:Flow|Test)\s*\d+[：:]\s*(.+)",
+        r"^##\s+\d+\.\s*(.+)",  # 仅匹配 ## 开头（两个 #），不匹配 ###
     ]
     for pattern in patterns:
-        matches = re.findall(pattern, spec_content)
+        matches = re.findall(pattern, spec_content, re.MULTILINE)
         if matches:
             flows = [m.strip() for m in matches]
             break
 
-    # fallback: 所有二级标题
+    # fallback: 所有二级标题（精确匹配 ## 而非 ###）
     if not flows:
-        flows = re.findall(r"^##\s+(.+)", spec_content, re.MULTILINE)
-        flows = [f.strip() for f in flows if not f.startswith("⛔") and len(f) > 2]
+        flows = re.findall(r"^##\s+(?!#)(.+)", spec_content, re.MULTILINE)
+        flows = [f.strip() for f in flows if not f.startswith("⛔") and len(f) > 2
+                 and not f.startswith("测试入口")]
 
     return flows
 

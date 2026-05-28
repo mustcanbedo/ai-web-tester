@@ -73,6 +73,11 @@ class ActionExecutor:
     def execute(self, action):
         action_type = action.get("type", "unknown")
         params = action.get("params", {})
+        # 兼容扁平格式：某些 LLM 不输出 params 包装层，直接把 ref/url/text 放顶层
+        if not params:
+            flat_keys = {k: v for k, v in action.items() if k not in ("type", "params", "description")}
+            if flat_keys:
+                params = flat_keys
         result = {"success": False, "message": "", "screenshot": None}
         try:
             if action_type == "navigate":
