@@ -49,16 +49,21 @@
 │  (前端 SPA)  │        REST API           │   路由 + 任务管理  │               └──────┘
 └──────────────┘                           └────────┬──────────┘
                                                     │
-                                    ┌───────────────┼───────────────┐
-                                    ▼               ▼               ▼
-                              test_runner.py   llm_engine.py   action_executor.py
-                              (测试循环)       (LLM 引擎)      (操作执行)
-                                    │
+                          ┌─────────────────────────┼─────────────────────────┐
+                          ▼                         ▼                         ▼
+                    test_runner.py            llm_engine.py           action_executor.py
+                    (测试循环+流程门控)       (LLM 引擎+Token预算)    (操作执行)
+                          │
+            ┌─────────────┼─────────────┬─────────────┐
+            ▼             ▼             ▼             ▼
+     planner_agent.py  reviewer_agent.py  test_memory.py  eval_engine.py
+     (计划生成+步骤跟踪) (Bug审查+误报过滤)  (跨流程记忆)    (质量评估)
+            │
+            ▼
+     playwright_bridge.py ──► Playwright (Chromium) + evidence.py
+     (浏览器桥接+自适应等待)         │                   (证据采集)
                                     ▼
-                             playwright_bridge.py ──► Playwright (Chromium)
-                             (浏览器桥接层)              │
-                                                        ▼
-                                                   目标 Web 应用
+                               目标 Web 应用
 ```
 
 ## 目录结构
